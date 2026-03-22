@@ -1,82 +1,144 @@
-# 💡 Lumen: illuminating Deep Learning in Pure Rust
+# Lumen
 
-**Lumen** 是一个轻量级、高性能的深度学习训练与推理框架，完全使用 Rust 编写。
+> A lightweight Rust deep learning core with dynamic autograd, modular neural network building blocks, and a CPU-oriented Llama inference path.
 
-它的设计理念借鉴 PyTorch，提供动态计算图（Dynamic Computational Graph）和模块化的 API 设计。Lumen不仅支持从零构建 CNN、RNN 和 MLP 进行训练，其内置的高性能算子和显存优化策略更使其能够高效运行现代 LLM（如 Llama 架构），在 CPU 上实现优秀的推理速度。
-
----
-
-## ✨ 核心特性 (Key Features)
-
-### 🧠 核心引擎
-
-* **Dynamic Autograd**: 实现了动态自动微分引擎，支持标量与张量级别的反向传播（Define-by-Run）。
-* **PyTorch-like API**: 采用 `Module` trait 设计，层（Layer）与模型（Model）的组合方式与 PyTorch 直觉一致。
-* **Optimizers & Loss**: 内置 SGD、Adam 等优化器及 CrossEntropy、MSE 等损失函数，支持完整的训练闭环。
-
-### 🚀 优秀性能 (High Performance)
-
-* **Static KV Cache**: 针对自回归模型（如 Llama）实现了**静态 KV Cache 预分配**策略，推理过程中 **0 动态内存分配**，彻底消除内存碎片。
-* **Decoding Optimization**: 针对 `Batch=1` 的 Decoding 阶段，实现了手写并行矩阵-向量乘法（Vector-Matrix Multiplication），突破 BLAS 库在小矩阵上的性能瓶颈。
-* **Zero-Copy Design**: 广泛使用内部可变性模式（Interior Mutability）和视图切片，最大程度减少张量数据的内存拷贝。
-* **Rayon Parallelism**: 对 GQA Attention、Softmax、RMSNorm 和 Convolution 进行了细粒度的多线程并行优化。
-
-### 🏗️ 丰富的模型支持
-
-* **Transformers**: 完整支持 **Llama** 架构，包含 **RoPE**（旋转位置编码）、**GQA**（分组查询注意力）和 **SwiGLU**等。
-* **RNN Family**: 原生支持 **RNN**、**LSTM**、**GRU**，适用于序列建模。
-* **CNN Support**: 支持卷积操作（Im2Col + GEMM），适用于计算机视觉任务。
+[中文 README](./README_zh-CN.md) · [English README](./README_EN.md)
 
 ---
 
-## 🛠️ 快速上手 (Getting Started)
+## Overview
 
-**Lumen** 包含了一个极速的 Llama 推理实现。
+Lumen is a compact deep learning project written in Rust. This release version keeps the **core library** and a **minimal runnable Llama inference example**, while removing test, benchmark, timing, and sweep code used during development.
 
-#### 准备工作
+The repository is useful in two roles:
 
-1. 下载 **TinyLlama-1.1B-Chat-v1.0** (或其他 Llama 模型) 的 `model.safetensors` 和 `tokenizer.json`。
-2. 在 `src/main.rs` 中配置路径：
-```rust
-let tokenizer_path = r"path/to/tokenizer.json";
-let weight_path = r"path/to/model.safetensors";
+- as a **learning-oriented DL core** for understanding tensors, autograd, layers, modules, and optimizers in Rust;
+- as a **small LLM inference skeleton** centered on a Llama-style architecture, safetensors loading, tokenization, and KV cache based incremental decoding.
 
+> `src/main.rs` is intentionally a **simple example program**. It demonstrates how to wire the library together for local inference, but it is **not** intended to represent a complete production CLI, serving stack, or general model runner.
+
+---
+
+## Technical Highlights
+
+- **Dynamic autograd engine** with tensor-based computation graph construction
+- **`Module`-style neural network abstraction** for composing trainable components
+- **Layer / op separation** for cleaner modeling and lower-level kernel evolution
+- **Llama-family decoder implementation** with:
+  - RMSNorm
+  - RoPE
+  - causal self-attention
+  - GQA (`num_key_value_heads`)
+  - SwiGLU-style MLP
+  - incremental decoding with **KV cache**
+- **CPU-oriented inference hot path optimizations**, including:
+  - Rayon-backed parallel computation
+  - row-major parallel matvec path for decode
+  - fused infer-time gate/up/SiLU path in MLP
+  - release profile tuned with `lto`, `panic = "abort"`, and `strip`
+- **Efficient weight loading** from `safetensors` via `memmap2`
+- **Tokenizer integration** through Hugging Face `tokenizers`
+
+---
+
+## Repository Layout
+
+```text
+src/
+├─ autograd.rs          # Tensor + dynamic autograd core
+├─ module.rs            # Module trait/macros
+├─ ops/                 # Tensor ops and kernels
+├─ layers/              # NN layers and attention building blocks
+├─ models/llama.rs      # Llama model implementation
+├─ loader.rs            # Safetensors weight loading
+├─ tokenizer.rs         # Hugging Face tokenizer wrapper
+├─ kv_cache.rs          # Legacy/simple KV cache implementation
+├─ optim.rs             # Optimizers
+├─ loss.rs              # Loss functions
+├─ init.rs              # Parameter initialization helpers
+└─ main.rs              # Minimal example entry for local inference
 ```
 
-3. (可选) 在 `main.rs` 或 `config` 中调整模型参数（如 `rope_theta`, `hidden_size`）。
+---
 
-#### 运行
+## Build
 
-为了获得最佳性能，**必须**使用 Release 模式并开启 CPU 原生指令集。
-
-**Linux / macOS:**
+Use release mode for practical performance:
 
 ```bash
-# 开启 AVX2/AVX-512 优化
-RUSTFLAGS="-C target-cpu=native" cargo run --release
-
+cargo build --release
 ```
 
-**Windows (PowerShell):**
+For better CPU utilization on your local machine:
+
+```bash
+RUSTFLAGS="-C target-cpu=native" cargo build --release
+```
+
+PowerShell:
 
 ```powershell
 $env:RUSTFLAGS = "-C target-cpu=native"
-cargo run --release
-
+cargo build --release
 ```
 
 ---
 
-## ⚡ 性能优化细节
+## Minimal Example Usage
 
-Lumen 在 CPU 推理上的高性能源于以下细节：
+The example program accepts model weights and a tokenizer file:
 
-1. **Static Memory Allocation**: 这里的 `LlamaKVCache` 并非简单的 `Vec`，而是基于预先计算的 `max_seq_len` 分配的一整块连续内存。推理时仅移动指针，无任何 `malloc` 开销。
-2. **Vector-Matrix Speculation**: 标准 BLAS 库在矩阵维度 `M=1` (即 Decoding 阶段) 时往往无法利用多核优势。Lumen 在 `ops/matmul.rs` 中检测到 `M=1` 时，会自动切换到基于 Rayon 的手动切块并行模式，大幅提升 CPU 利用率。
-3. **Parallel GQA**: 多头注意力（Multi-Head Attention）的计算在 Head 维度被完全并行化。
+```bash
+cargo run --release -- \
+  --weights path/to/model.safetensors \
+  --tokenizer path/to/tokenizer.json
+```
+
+Optional arguments:
+
+- `--system`
+- `--temperature`
+- `--top-p`
+- `--repetition-penalty`
+- `--recent-window`
+- `--max-gen`
+
+Interactive commands in the example chat loop:
+
+- `/reset` — clear conversation state and KV cache
+- `/exit` — quit the program
 
 ---
 
-## 📄 License
+## Important Note About `main.rs`
 
-GPL v3.0 License.
+`src/main.rs` uses a **hard-coded `model_config()`** and a very lightweight CLI flow. This is deliberate: it keeps the example easy to read.
+
+But it also means:
+
+- the model architecture in `model_config()` must match the loaded weights;
+- tokenizer vocabulary must be compatible with the configured `vocab_size` and prompt format;
+- adapting to other checkpoints may require updating dimensions, layer counts, attention layout, special tokens, or prompt template logic.
+
+In other words, **`main.rs` is a simple integration example, not a universal launcher**.
+
+---
+
+## Why This Project Stands Out
+
+Unlike many toy Rust ML repos that stop at tensors or MLP demos, Lumen connects several layers of the stack together in one codebase:
+
+- tensor + autograd fundamentals,
+- reusable NN modules,
+- Llama decoder architecture,
+- checkpoint loading,
+- tokenizer bridging,
+- stateful autoregressive decoding.
+
+That makes it a good foundation for studying how a small Rust-native DL/LLM runtime can be assembled end to end.
+
+---
+
+## License
+
+GPL v3.0
