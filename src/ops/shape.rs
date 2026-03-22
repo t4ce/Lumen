@@ -77,8 +77,12 @@ pub fn permute(input: &Tensor, axes: Vec<usize>) -> Tensor {
 pub fn cat(tensors: &[Tensor], axis: usize) -> Tensor {
     assert!(!tensors.is_empty(), "Concat expects at least one tensor");
 
-    // cat 必然 materialize
-    let arrays: Vec<_> = tensors.iter().map(|t| t.data_ref().to_owned()).collect();
+    if tensors.len() == 1 && (is_no_grad() || !tensors[0].requires_grad()) {
+        return tensors[0].clone();
+    }
+
+    // concatenate 本身会 materialize 结果；输入侧尽量保持零拷贝 view
+    let arrays: Vec<_> = tensors.iter().map(|t| t.data_arc()).collect();
     let views: Vec<_> = arrays.iter().map(|a| a.view()).collect();
 
     let axis_obj = Axis(axis);
@@ -112,20 +116,28 @@ pub fn cat(tensors: &[Tensor], axis: usize) -> Tensor {
 }
 
 pub fn slice_last_dim(input: &Tensor, start: usize, end: usize) -> Tensor {
-    let input_data = input.data_ref();
-    let last_dim = input_data.ndim() - 1;
+    let last_dim = {
+        let input_data = input.data_ref();
+        input_data.ndim() - 1
+    };
     let axis = ndarray::Axis(last_dim);
 
-    // 这里先保持 materialize（便于 backward）
+    if (is_no_grad() || !input.requires_grad()) && start == 0 && end == input.data_ref().shape()[last_dim] {
+        return input.clone();
+    }
+
+    if is_no_grad() || !input.requires_grad() {
+        let mut sliced = input.data_arc();
+        sliced.slice_axis_inplace(axis, ndarray::Slice::from(start..end));
+        return Tensor::from_data_no_grad(sliced.into_dyn());
+    }
+
+    let input_data = input.data_ref();
     let sliced = input_data
         .slice_axis(axis, ndarray::Slice::from(start..end))
         .to_owned()
         .into_dyn()
         .into_shared();
-
-    if is_no_grad() || !input.requires_grad() {
-        return Tensor::from_data_no_grad(sliced);
-    }
 
     let input_clone = input.clone();
     let full_shape = input_data.shape().to_vec();

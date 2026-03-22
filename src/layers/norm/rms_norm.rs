@@ -1,4 +1,4 @@
-use crate::autograd::{Tensor, TensorData};
+use crate::autograd::{is_no_grad, Tensor, TensorData};
 use crate::module::Module;
 use ndarray::{Array1, Array2, Zip};
 use rayon::prelude::*;
@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 pub struct RMSNorm {
-    pub weight: Tensor, // Gamma 参数
+    pub weight: Tensor,
     pub eps: f32,
 }
 
@@ -26,7 +26,7 @@ impl Module for RMSNorm {
             let input_ref = input.data_ref();
             let x = &*input_ref;
 
-            let shape = x.shape().to_vec(); // clone shape to return it out of block
+            let shape = x.shape().to_vec();
             let dim = shape[shape.len() - 1];
             let rows = x.len() / dim;
 
@@ -34,24 +34,18 @@ impl Module for RMSNorm {
             let x_2d = x_cow.view().into_shape((rows, dim)).unwrap();
 
             let w_ref = self.weight.data_ref();
-            let w_1d = w_ref
-                .as_slice()
-                .expect("RMSNorm weight should be contiguous");
+            let w_1d = w_ref.as_slice().expect("RMSNorm weight should be contiguous");
 
             let mut output_flat = Array2::<f32>::zeros((rows, dim));
             let eps = self.eps;
 
-            // Forward 并行计算 (Fused Kernel)
             Zip::from(output_flat.outer_iter_mut())
                 .and(x_2d.outer_iter())
                 .par_for_each(|mut out_row, x_row| {
-                    // SumSq
                     let sum_sq = x_row.fold(0.0f32, |acc, &val| acc + val * val);
-                    // RMS & InvRMS
                     let rms = (sum_sq / dim as f32 + eps).sqrt();
                     let inv_rms = 1.0 / rms;
 
-                    // Normalize & Scale
                     for (o, (&xi, &wi)) in out_row.iter_mut().zip(x_row.iter().zip(w_1d)) {
                         *o = xi * inv_rms * wi;
                     }
@@ -60,17 +54,21 @@ impl Module for RMSNorm {
             let out_d = output_flat.into_shape(shape.clone()).unwrap().into_dyn();
             (out_d, rows, dim, shape)
         };
+        let build_graph = !is_no_grad() && (input.requires_grad() || self.weight.requires_grad());
+
+        if !build_graph {
+            return Tensor::from_array_no_grad(output_data);
+        }
 
         let input_clone = input.clone();
         let weight_clone = self.weight.clone();
-        let eps = self.eps; // copy scalar
+        let eps = self.eps;
 
         Tensor(Rc::new(RefCell::new(TensorData {
             data: output_data.into_shared(),
             grad: None,
             parents: vec![input.clone(), self.weight.clone()],
             backward_op: Some(Box::new(move |grad_output| {
-                // Backward 逻辑
                 let x_ref = input_clone.data_ref();
                 let x_cow = x_ref.as_standard_layout();
                 let x_2d = x_cow.view().into_shape((rows, dim)).unwrap();
@@ -81,23 +79,17 @@ impl Module for RMSNorm {
                 let g_cow = grad_output.as_standard_layout();
                 let g_2d = g_cow.view().into_shape((rows, dim)).unwrap();
 
-                //计算输入梯度 dL/dx
                 let mut d_input_flat = Array2::<f32>::zeros((rows, dim));
-
-                //计算 dInput (并行)
                 Zip::from(d_input_flat.outer_iter_mut())
                     .and(x_2d.outer_iter())
                     .and(g_2d.outer_iter())
                     .par_for_each(|mut dx_row, x_row, g_row| {
-                        // Recompute RMS
                         let sum_sq = x_row.fold(0.0f32, |acc, &val| acc + val * val);
                         let inv_rms = 1.0 / (sum_sq / dim as f32 + eps).sqrt();
                         let inv_dim = 1.0 / dim as f32;
 
-                        // dot = sum(g * w * x_norm)
                         let mut dot = 0.0f32;
-                        for (&gi, (&wi, &xi)) in g_row.iter().zip(w_slice.iter().zip(x_row.iter()))
-                        {
+                        for (&gi, (&wi, &xi)) in g_row.iter().zip(w_slice.iter().zip(x_row.iter())) {
                             dot += (gi * wi) * (xi * inv_rms);
                         }
 
@@ -115,7 +107,6 @@ impl Module for RMSNorm {
 
                 input_clone.add_grad(d_input_flat.into_shape(shape.clone()).unwrap().into_dyn());
 
-                //计算权重梯度 dL/dw (并行归约)
                 let dw_accum = (0..rows)
                     .into_par_iter()
                     .fold(
@@ -127,9 +118,7 @@ impl Module for RMSNorm {
                             let sum_sq = x_row.fold(0.0f32, |a, &v| a + v * v);
                             let inv_rms = 1.0 / (sum_sq / dim as f32 + eps).sqrt();
 
-                            for (a, (&gi, &xi)) in
-                                acc.iter_mut().zip(g_row.iter().zip(x_row.iter()))
-                            {
+                            for (a, (&gi, &xi)) in acc.iter_mut().zip(g_row.iter().zip(x_row.iter())) {
                                 *a += gi * xi * inv_rms;
                             }
                             acc

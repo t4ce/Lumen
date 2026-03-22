@@ -1,16 +1,345 @@
 use crate::autograd::{Tensor, TensorData, is_no_grad};
-use ndarray::{Array2, Array4, Ix2, Ix4, Zip};
+use ndarray::{Array2, Array4, Ix2, Ix4, IxDyn, Zip};
 use ndarray::linalg::general_mat_mul;
-use rayon::prelude::*; // 用于并行优化
+use rayon::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
+
+const MATVEC_BLOCK_ROWS: usize = 16;
+const ARGMAX_BLOCK_ROWS: usize = 32;
+const MATVEC_BLOCK_THRESHOLD: usize = 16384;
+const MATVEC_PAR_THRESHOLD: usize = 256;
+
+#[inline]
+pub(crate) fn dot_unrolled(x: &[f32], row: &[f32]) -> f32 {
+    let mut s0 = 0.0f32;
+    let mut s1 = 0.0f32;
+    let mut s2 = 0.0f32;
+    let mut s3 = 0.0f32;
+    let mut kk = 0usize;
+    let k_dim = x.len();
+
+    while kk + 8 <= k_dim {
+        s0 += row[kk] * x[kk] + row[kk + 4] * x[kk + 4];
+        s1 += row[kk + 1] * x[kk + 1] + row[kk + 5] * x[kk + 5];
+        s2 += row[kk + 2] * x[kk + 2] + row[kk + 6] * x[kk + 6];
+        s3 += row[kk + 3] * x[kk + 3] + row[kk + 7] * x[kk + 7];
+        kk += 8;
+    }
+
+    while kk + 4 <= k_dim {
+        s0 += row[kk] * x[kk];
+        s1 += row[kk + 1] * x[kk + 1];
+        s2 += row[kk + 2] * x[kk + 2];
+        s3 += row[kk + 3] * x[kk + 3];
+        kk += 4;
+    }
+
+    let mut sum = s0 + s1 + s2 + s3;
+    while kk < k_dim {
+        sum += row[kk] * x[kk];
+        kk += 1;
+    }
+    sum
+}
+
+#[inline]
+fn matvec_rowmajor_serial(x: &[f32], w_rowmajor: &[f32], n_rows: usize, k_dim: usize, out: &mut [f32]) {
+    for i in 0..n_rows {
+        let row = &w_rowmajor[i * k_dim..(i + 1) * k_dim];
+        out[i] = dot_unrolled(x, row);
+    }
+}
+
+#[inline]
+fn matvec_rowmajor_rowwise_parallel(x: &[f32], w_rowmajor: &[f32], n_rows: usize, k_dim: usize, out: &mut [f32]) {
+    out.par_iter_mut().enumerate().for_each(|(i, out_val)| {
+        let row = &w_rowmajor[i * k_dim..(i + 1) * k_dim];
+        *out_val = dot_unrolled(x, row);
+    });
+}
+
+#[inline]
+fn matvec_rowmajor_block_parallel(x: &[f32], w_rowmajor: &[f32], n_rows: usize, k_dim: usize, out: &mut [f32]) {
+    out.par_chunks_mut(MATVEC_BLOCK_ROWS)
+        .enumerate()
+        .for_each(|(block_idx, out_chunk)| {
+            let row_start = block_idx * MATVEC_BLOCK_ROWS;
+            let rows = out_chunk.len();
+            let w_block = &w_rowmajor[row_start * k_dim..(row_start + rows) * k_dim];
+            let mut acc = [0.0f32; MATVEC_BLOCK_ROWS];
+
+            let mut kk = 0usize;
+            while kk + 8 <= k_dim {
+                let x0 = x[kk];
+                let x1 = x[kk + 1];
+                let x2 = x[kk + 2];
+                let x3 = x[kk + 3];
+                let x4 = x[kk + 4];
+                let x5 = x[kk + 5];
+                let x6 = x[kk + 6];
+                let x7 = x[kk + 7];
+                for r in 0..rows {
+                    let base = r * k_dim + kk;
+                    acc[r] += w_block[base] * x0
+                        + w_block[base + 1] * x1
+                        + w_block[base + 2] * x2
+                        + w_block[base + 3] * x3
+                        + w_block[base + 4] * x4
+                        + w_block[base + 5] * x5
+                        + w_block[base + 6] * x6
+                        + w_block[base + 7] * x7;
+                }
+                kk += 8;
+            }
+
+            while kk < k_dim {
+                let xv = x[kk];
+                for r in 0..rows {
+                    acc[r] += w_block[r * k_dim + kk] * xv;
+                }
+                kk += 1;
+            }
+
+            out_chunk.copy_from_slice(&acc[..rows]);
+        });
+}
+
+#[inline]
+pub fn matvec_rowmajor_parallel(x: &[f32], w_rowmajor: &[f32], n_rows: usize, k_dim: usize, out: &mut [f32]) {
+    assert_eq!(x.len(), k_dim, "x len / k_dim mismatch");
+    assert_eq!(w_rowmajor.len(), n_rows * k_dim, "weight size mismatch");
+    assert_eq!(out.len(), n_rows, "out size mismatch");
+
+    if n_rows < MATVEC_PAR_THRESHOLD {
+        matvec_rowmajor_serial(x, w_rowmajor, n_rows, k_dim, out);
+    } else if n_rows >= MATVEC_BLOCK_THRESHOLD {
+        matvec_rowmajor_block_parallel(x, w_rowmajor, n_rows, k_dim, out);
+    } else {
+        matvec_rowmajor_rowwise_parallel(x, w_rowmajor, n_rows, k_dim, out);
+    }
+}
+
+
+#[inline]
+pub(crate) fn dot2_unrolled(x: &[f32], row0: &[f32], row1: &[f32]) -> (f32, f32) {
+    let mut a0 = 0.0f32;
+    let mut a1 = 0.0f32;
+    let mut b0 = 0.0f32;
+    let mut b1 = 0.0f32;
+    let mut c0 = 0.0f32;
+    let mut c1 = 0.0f32;
+    let mut d0 = 0.0f32;
+    let mut d1 = 0.0f32;
+    let mut kk = 0usize;
+    let k_dim = x.len();
+
+    while kk + 8 <= k_dim {
+        let x0 = x[kk];
+        let x1 = x[kk + 1];
+        let x2 = x[kk + 2];
+        let x3 = x[kk + 3];
+        let x4 = x[kk + 4];
+        let x5 = x[kk + 5];
+        let x6 = x[kk + 6];
+        let x7 = x[kk + 7];
+
+        a0 += row0[kk] * x0 + row0[kk + 4] * x4;
+        a1 += row1[kk] * x0 + row1[kk + 4] * x4;
+        b0 += row0[kk + 1] * x1 + row0[kk + 5] * x5;
+        b1 += row1[kk + 1] * x1 + row1[kk + 5] * x5;
+        c0 += row0[kk + 2] * x2 + row0[kk + 6] * x6;
+        c1 += row1[kk + 2] * x2 + row1[kk + 6] * x6;
+        d0 += row0[kk + 3] * x3 + row0[kk + 7] * x7;
+        d1 += row1[kk + 3] * x3 + row1[kk + 7] * x7;
+        kk += 8;
+    }
+
+    while kk + 4 <= k_dim {
+        let x0 = x[kk];
+        let x1 = x[kk + 1];
+        let x2 = x[kk + 2];
+        let x3 = x[kk + 3];
+        a0 += row0[kk] * x0;
+        a1 += row1[kk] * x0;
+        b0 += row0[kk + 1] * x1;
+        b1 += row1[kk + 1] * x1;
+        c0 += row0[kk + 2] * x2;
+        c1 += row1[kk + 2] * x2;
+        d0 += row0[kk + 3] * x3;
+        d1 += row1[kk + 3] * x3;
+        kk += 4;
+    }
+
+    let mut sum0 = a0 + b0 + c0 + d0;
+    let mut sum1 = a1 + b1 + c1 + d1;
+    while kk < k_dim {
+        let xv = x[kk];
+        sum0 += row0[kk] * xv;
+        sum1 += row1[kk] * xv;
+        kk += 1;
+    }
+    (sum0, sum1)
+}
+
+#[inline]
+pub(crate) fn dual_matvec_rowmajor_parallel(
+    x: &[f32],
+    w0_rowmajor: &[f32],
+    w1_rowmajor: &[f32],
+    n_rows: usize,
+    k_dim: usize,
+    out0: &mut [f32],
+    out1: &mut [f32],
+) {
+    assert_eq!(x.len(), k_dim, "x len / k_dim mismatch");
+    assert_eq!(w0_rowmajor.len(), n_rows * k_dim, "weight0 size mismatch");
+    assert_eq!(w1_rowmajor.len(), n_rows * k_dim, "weight1 size mismatch");
+    assert_eq!(out0.len(), n_rows, "out0 size mismatch");
+    assert_eq!(out1.len(), n_rows, "out1 size mismatch");
+
+    if n_rows < MATVEC_PAR_THRESHOLD {
+        for i in 0..n_rows {
+            let row0 = &w0_rowmajor[i * k_dim..(i + 1) * k_dim];
+            let row1 = &w1_rowmajor[i * k_dim..(i + 1) * k_dim];
+            let (s0, s1) = dot2_unrolled(x, row0, row1);
+            out0[i] = s0;
+            out1[i] = s1;
+        }
+    } else {
+        out0.par_iter_mut()
+            .zip(out1.par_iter_mut())
+            .enumerate()
+            .for_each(|(i, (dst0, dst1))| {
+                let row0 = &w0_rowmajor[i * k_dim..(i + 1) * k_dim];
+                let row1 = &w1_rowmajor[i * k_dim..(i + 1) * k_dim];
+                let (s0, s1) = dot2_unrolled(x, row0, row1);
+                *dst0 = s0;
+                *dst1 = s1;
+            });
+    }
+}
+
+#[inline]
+pub fn dual_matvec_silu_mul_rowmajor_parallel(
+    x: &[f32],
+    gate_w_rowmajor: &[f32],
+    up_w_rowmajor: &[f32],
+    n_rows: usize,
+    k_dim: usize,
+    out: &mut [f32],
+) {
+    assert_eq!(x.len(), k_dim, "x len / k_dim mismatch");
+    assert_eq!(gate_w_rowmajor.len(), n_rows * k_dim, "gate weight size mismatch");
+    assert_eq!(up_w_rowmajor.len(), n_rows * k_dim, "up weight size mismatch");
+    assert_eq!(out.len(), n_rows, "out size mismatch");
+
+    if n_rows < MATVEC_PAR_THRESHOLD {
+        for i in 0..n_rows {
+            let gate_row = &gate_w_rowmajor[i * k_dim..(i + 1) * k_dim];
+            let up_row = &up_w_rowmajor[i * k_dim..(i + 1) * k_dim];
+            let (g, u) = dot2_unrolled(x, gate_row, up_row);
+            let sig = 1.0 / (1.0 + (-g).exp());
+            out[i] = (g * sig) * u;
+        }
+    } else {
+        out.par_iter_mut().enumerate().for_each(|(i, out_val)| {
+            let gate_row = &gate_w_rowmajor[i * k_dim..(i + 1) * k_dim];
+            let up_row = &up_w_rowmajor[i * k_dim..(i + 1) * k_dim];
+            let (g, u) = dot2_unrolled(x, gate_row, up_row);
+            let sig = 1.0 / (1.0 + (-g).exp());
+            *out_val = (g * sig) * u;
+        });
+    }
+}
+
+#[inline]
+pub fn matvec_argmax_rowmajor_parallel(x: &[f32], w_rowmajor: &[f32], n_rows: usize, k_dim: usize) -> usize {
+    assert_eq!(x.len(), k_dim, "x len / k_dim mismatch");
+    assert_eq!(w_rowmajor.len(), n_rows * k_dim, "weight size mismatch");
+
+    if n_rows >= MATVEC_BLOCK_THRESHOLD {
+        let n_blocks = (n_rows + ARGMAX_BLOCK_ROWS - 1) / ARGMAX_BLOCK_ROWS;
+        return (0..n_blocks)
+            .into_par_iter()
+            .map(|block_idx| {
+                let row_start = block_idx * ARGMAX_BLOCK_ROWS;
+                let rows = (n_rows - row_start).min(ARGMAX_BLOCK_ROWS);
+                let w_block = &w_rowmajor[row_start * k_dim..(row_start + rows) * k_dim];
+                let mut acc = [0.0f32; ARGMAX_BLOCK_ROWS];
+
+                let mut kk = 0usize;
+                while kk + 8 <= k_dim {
+                    let x0 = x[kk];
+                    let x1 = x[kk + 1];
+                    let x2 = x[kk + 2];
+                    let x3 = x[kk + 3];
+                    let x4 = x[kk + 4];
+                    let x5 = x[kk + 5];
+                    let x6 = x[kk + 6];
+                    let x7 = x[kk + 7];
+                    for r in 0..rows {
+                        let base = r * k_dim + kk;
+                        acc[r] += w_block[base] * x0
+                            + w_block[base + 1] * x1
+                            + w_block[base + 2] * x2
+                            + w_block[base + 3] * x3
+                            + w_block[base + 4] * x4
+                            + w_block[base + 5] * x5
+                            + w_block[base + 6] * x6
+                            + w_block[base + 7] * x7;
+                    }
+                    kk += 8;
+                }
+
+                while kk < k_dim {
+                    let xv = x[kk];
+                    for r in 0..rows {
+                        acc[r] += w_block[r * k_dim + kk] * xv;
+                    }
+                    kk += 1;
+                }
+
+                let mut best = (row_start, f32::NEG_INFINITY);
+                for r in 0..rows {
+                    let cand = (row_start + r, acc[r]);
+                    if cand.1 > best.1 {
+                        best = cand;
+                    }
+                }
+                best
+            })
+            .reduce(|| (0usize, f32::NEG_INFINITY), |a, b| if a.1 >= b.1 { a } else { b })
+            .0;
+    }
+
+    if n_rows < MATVEC_PAR_THRESHOLD {
+        let mut best = (0usize, f32::NEG_INFINITY);
+        for i in 0..n_rows {
+            let row = &w_rowmajor[i * k_dim..(i + 1) * k_dim];
+            let score = dot_unrolled(x, row);
+            if score > best.1 {
+                best = (i, score);
+            }
+        }
+        best.0
+    } else {
+        (0..n_rows)
+            .into_par_iter()
+            .map(|i| {
+                let row = &w_rowmajor[i * k_dim..(i + 1) * k_dim];
+                (i, dot_unrolled(x, row))
+            })
+            .reduce(|| (0usize, f32::NEG_INFINITY), |a, b| if a.1 >= b.1 { a } else { b })
+            .0
+    }
+}
 
 // A[..., K] @ B^T, where B is [N(out), K(in)]
 // output: [..., N]
 pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
     let build_graph = !is_no_grad() && (a.requires_grad() || b.requires_grad());
 
-    // 只读取 shape/len，不 clone 整个 data
     let (a_shape, b_shape, a_len) = {
         let ad = a.0.borrow();
         let bd = b.0.borrow();
@@ -25,7 +354,6 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
         panic!("MatMul RHS must be 2D, got {:?}", b_shape);
     }
 
-    // b: [N, K]
     let k_dim_a = a_shape[a_shape.len() - 1];
     let n_dim = b_shape[0];
     let k_dim_b = b_shape[1];
@@ -39,44 +367,82 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
 
     let m_dim = a_len / k_dim_a;
 
+    let decode_no_grad = if m_dim == 1 && !build_graph {
+        let ad = a.0.borrow();
+        let bd = b.0.borrow();
+
+        let a_owned;
+        let a_vec: &[f32] = if let Some(s) = ad.data.as_slice() {
+            s
+        } else {
+            a_owned = ad.data.iter().copied().collect::<Vec<f32>>();
+            a_owned.as_slice()
+        };
+
+        let b_2d = bd.data.view().into_dimensionality::<Ix2>().unwrap();
+        let mut out_shape = a_shape.clone();
+        let last_idx = out_shape.len() - 1;
+        out_shape[last_idx] = n_dim;
+
+        let mut result = ndarray::ArrayD::<f32>::zeros(IxDyn(&out_shape)).into_shared();
+        let out_slice = result
+            .as_slice_mut()
+            .expect("decode matmul output should be contiguous");
+
+        let b_owned;
+        let b_slice: &[f32] = if let Some(s) = b_2d.as_slice() {
+            s
+        } else {
+            b_owned = b_2d.as_standard_layout().to_owned();
+            b_owned
+                .as_slice()
+                .expect("standard-layout matmul RHS should be contiguous")
+        };
+        matvec_rowmajor_parallel(a_vec, b_slice, n_dim, k_dim_a, out_slice);
+
+        Some(result)
+    } else {
+        None
+    };
+
+    if let Some(result) = decode_no_grad {
+        return Tensor::from_data_no_grad(result);
+    }
+
     let res_2d = if m_dim == 1 {
         let ad = a.0.borrow();
         let bd = b.0.borrow();
-        
-        // A: [K] (视为向量)
-        let a_vec = ad.data.as_slice().expect("A data should be contiguous for optimal perf");
-        
-        // B: [N, K]
-        let b_view = bd.data.view().into_dimensionality::<Ix2>().unwrap();
-        
-        // 预分配结果 [1, N]
-        let mut res = Array2::<f32>::zeros((1, n_dim));
-        let res_slice = res.as_slice_mut().unwrap();
 
-        // Rayon 并行遍历输出维度 N
-        // 将计算任务均匀分配给所有 CPU 核心
-        res_slice.par_iter_mut().enumerate().for_each(|(i, out_val)| {
-            let row_b = b_view.row(i);
-            
-            // 手动点积 (编译器会自动 SIMD 优化)
-            let mut sum = 0.0f32;
-            for (&w, &x) in row_b.iter().zip(a_vec.iter()) {
-                sum += w * x;
-            }
-            *out_val = sum;
-        });
-        
-        res
+        let a_owned;
+        let a_vec: &[f32] = if let Some(s) = ad.data.as_slice() {
+            s
+        } else {
+            a_owned = ad.data.iter().copied().collect::<Vec<f32>>();
+            a_owned.as_slice()
+        };
+
+        let b_2d = bd.data.view().into_dimensionality::<Ix2>().unwrap();
+        let mut out_vec = vec![0.0f32; n_dim];
+
+        let b_owned;
+        let b_slice: &[f32] = if let Some(s) = b_2d.as_slice() {
+            s
+        } else {
+            b_owned = b_2d.as_standard_layout().to_owned();
+            b_owned
+                .as_slice()
+                .expect("standard-layout matmul RHS should be contiguous")
+        };
+        matvec_rowmajor_parallel(a_vec, b_slice, n_dim, k_dim_a, &mut out_vec);
+
+        Array2::from_shape_vec((1, n_dim), out_vec).expect("decode matvec shape build failed")
     } else {
-        // M > 1 (Prefill 阶段): 使用通用的 BLAS 加速 (general_mat_mul)
-        // 此时计算量足够大，BLAS 效率通常高于手写并行
         let ad = a.0.borrow();
         let bd = b.0.borrow();
 
-        let b_2d = bd.data.view().into_dimensionality::<Ix2>().unwrap(); // [N,K]
+        let b_2d = bd.data.view().into_dimensionality::<Ix2>().unwrap();
         let mut res = Array2::<f32>::zeros((m_dim, n_dim));
 
-        // 尝试 View，失败则 Copy (处理非连续内存)
         if let Ok(a_2d_view) = ad.data.view().into_shape((m_dim, k_dim_a)) {
             general_mat_mul(1.0, &a_2d_view, &b_2d.t(), 0.0, &mut res);
         } else {
@@ -91,7 +457,6 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
         res
     };
 
-    // 恢复输出形状: [..., N]
     let mut out_shape = a_shape.clone();
     let last_idx = out_shape.len() - 1;
     out_shape[last_idx] = n_dim;
@@ -111,7 +476,6 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
         parents: vec![a_clone.clone(), b_clone.clone()],
         requires_grad: true,
         backward_op: Some(Box::new(move |grad: &ndarray::ArrayViewD<f32>| {
-            // grad: [..., N] -> [M,N]
             let g_len = grad.len();
             let g_m = g_len / n_dim;
 
@@ -120,14 +484,12 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
                 .into_shape((g_m, n_dim))
                 .expect("Grad reshape failed: non-contiguous gradient?");
 
-            // Backward 必须 clone 数据以避免 RefCell 借用冲突 (仅训练时触发)
             let (a_data, b_data) = {
                 let ad = a_clone.0.borrow();
                 let bd = b_clone.0.borrow();
                 (ad.data.clone(), bd.data.clone())
             };
 
-            // A -> [M,K]
             let a_2d_view = a_data.view().into_shape((m_dim, k_dim_a));
             let a_2d_owned;
             let a_2d = match a_2d_view {
@@ -138,15 +500,12 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
                 }
             };
 
-            // B -> [N,K]
             let b_2d = b_data.view().into_dimensionality::<Ix2>().unwrap();
 
-            // dA = dY @ B  -> [M,K]
             let mut da_2d = Array2::<f32>::zeros((m_dim, k_dim_a));
             general_mat_mul(1.0, &grad_2d, &b_2d, 0.0, &mut da_2d);
             a_clone.add_grad(da_2d.into_shape(a_data.shape()).unwrap().into_dyn());
 
-            // dB = dY^T @ A -> [N,K]
             let mut db_2d = Array2::<f32>::zeros((n_dim, k_dim_a));
             general_mat_mul(1.0, &grad_2d.t(), &a_2d, 0.0, &mut db_2d);
             b_clone.add_grad(db_2d.into_dyn());
@@ -175,7 +534,6 @@ pub fn batch_matmul(lhs: &Tensor, rhs: &Tensor) -> Tensor {
 
     let mut output = Array4::<f32>::zeros((b, h, m, n));
 
-    // 使用串行 Zip 避免 RefCell 跨线程问题 (内部 BLAS 会处理并行)
     Zip::from(output.outer_iter_mut())
         .and(lhs_view.outer_iter())
         .and(rhs_view.outer_iter())

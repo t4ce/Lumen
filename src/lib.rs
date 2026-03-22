@@ -3,7 +3,6 @@
 pub mod autograd;
 #[macro_use] pub mod module;
 pub mod optim;
-pub mod mnist_loader;
 pub mod loss;
 pub mod ops;
 pub mod init;

@@ -1,10 +1,9 @@
-use crate::autograd::{Tensor, TensorData};
+use crate::autograd::{is_no_grad, Tensor, TensorData};
 use crate::module::Module;
-use ndarray::{Array2, ArrayD, Zip};
+use ndarray::{Array2, Zip};
 use std::cell::RefCell;
 use std::rc::Rc;
 
-// --- ReLU ---
 pub struct ReLU;
 impl ReLU {
     pub fn new() -> Self {
@@ -14,10 +13,15 @@ impl ReLU {
 
 impl Module for ReLU {
     fn forward(&self, input: Tensor) -> Tensor {
-        let input_ref = input.data_ref();
+        let data = {
+            let input_ref = input.data_ref();
+            Zip::from(&*input_ref).par_map_collect(|&x| x.max(0.0))
+        };
+        let build_graph = !is_no_grad() && input.requires_grad();
 
-        // Forward: 并行计算 x.max(0.0)
-        let data = Zip::from(&*input_ref).par_map_collect(|&x| x.max(0.0));
+        if !build_graph {
+            return Tensor::from_data_no_grad(data.into_shared());
+        }
 
         let input_clone = input.clone();
         Tensor(Rc::new(RefCell::new(TensorData {
@@ -27,8 +31,6 @@ impl Module for ReLU {
             backward_op: Some(Box::new(move |grad| {
                 let input_d = input_clone.data_ref();
                 let mut grad_input = grad.to_owned().into_dyn();
-
-                // Backward: 原地修改梯度
                 Zip::from(grad_input.view_mut())
                     .and(&*input_d)
                     .par_for_each(|g, &x| {
@@ -46,7 +48,6 @@ impl Module for ReLU {
     }
 }
 
-// --- Sigmoid ---
 pub struct Sigmoid;
 impl Sigmoid {
     pub fn new() -> Self {
@@ -56,10 +57,15 @@ impl Sigmoid {
 
 impl Module for Sigmoid {
     fn forward(&self, input: Tensor) -> Tensor {
-        let input_ref = input.data_ref();
+        let data = {
+            let input_ref = input.data_ref();
+            Zip::from(&*input_ref).par_map_collect(|&x| 1.0 / (1.0 + (-x).exp()))
+        };
+        let build_graph = !is_no_grad() && input.requires_grad();
 
-        // Forward: 1 / (1 + exp(-x))
-        let data = Zip::from(&*input_ref).par_map_collect(|&x| 1.0 / (1.0 + (-x).exp()));
+        if !build_graph {
+            return Tensor::from_data_no_grad(data.into_shared());
+        }
 
         let output_data = data.clone();
         let input_clone = input.clone();
@@ -70,13 +76,11 @@ impl Module for Sigmoid {
             parents: vec![input.clone()],
             backward_op: Some(Box::new(move |grad| {
                 let mut grad_input = grad.to_owned().into_dyn();
-                // Backward: grad * y * (1 - y)
                 Zip::from(grad_input.view_mut())
                     .and(&output_data)
                     .par_for_each(|g, &y| {
                         *g = *g * y * (1.0 - y);
                     });
-
                 input_clone.add_grad(grad_input);
             })),
             requires_grad: true,
@@ -87,7 +91,6 @@ impl Module for Sigmoid {
     }
 }
 
-// --- Tanh ---
 pub struct Tanh;
 impl Tanh {
     pub fn new() -> Self {
@@ -97,10 +100,15 @@ impl Tanh {
 
 impl Module for Tanh {
     fn forward(&self, input: Tensor) -> Tensor {
-        let input_ref = input.data_ref();
+        let data = {
+            let input_ref = input.data_ref();
+            Zip::from(&*input_ref).par_map_collect(|&x| x.tanh())
+        };
+        let build_graph = !is_no_grad() && input.requires_grad();
 
-        // Forward: tanh(x)
-        let data = Zip::from(&*input_ref).par_map_collect(|&x| x.tanh());
+        if !build_graph {
+            return Tensor::from_data_no_grad(data.into_shared());
+        }
 
         let output_data = data.clone();
         let input_clone = input.clone();
@@ -111,7 +119,6 @@ impl Module for Tanh {
             parents: vec![input.clone()],
             backward_op: Some(Box::new(move |grad| {
                 let mut grad_input = grad.to_owned().into_dyn();
-                // Backward: grad * (1 - y^2)
                 Zip::from(grad_input.view_mut())
                     .and(&output_data)
                     .par_for_each(|g, &y| {
@@ -127,7 +134,6 @@ impl Module for Tanh {
     }
 }
 
-// --- SiLU (Swish) ---
 pub struct SiLU;
 impl SiLU {
     pub fn new() -> Self {
@@ -137,13 +143,18 @@ impl SiLU {
 
 impl Module for SiLU {
     fn forward(&self, input: Tensor) -> Tensor {
-        let input_ref = input.data_ref();
+        let data = {
+            let input_ref = input.data_ref();
+            Zip::from(&*input_ref).par_map_collect(|&x| {
+                let sig = 1.0 / (1.0 + (-x).exp());
+                x * sig
+            })
+        };
+        let build_graph = !is_no_grad() && input.requires_grad();
 
-        // Forward: x * sigmoid(x)
-        let data = Zip::from(&*input_ref).par_map_collect(|&x| {
-            let sig = 1.0 / (1.0 + (-x).exp());
-            x * sig
-        });
+        if !build_graph {
+            return Tensor::from_data_no_grad(data.into_shared());
+        }
 
         let input_clone = input.clone();
 
@@ -153,12 +164,10 @@ impl Module for SiLU {
             parents: vec![input.clone()],
             backward_op: Some(Box::new(move |grad| {
                 let x_ref = input_clone.data_ref();
-                // Backward: dL/dx = grad * (sig + x * sig * (1 - sig))
                 let dx = Zip::from(&*x_ref).par_map_collect(|&x| {
                     let sig = 1.0 / (1.0 + (-x).exp());
                     sig + x * sig * (1.0 - sig)
                 });
-
                 input_clone.add_grad((&dx * grad).into_dyn());
             })),
             requires_grad: true,
@@ -181,45 +190,49 @@ impl Softmax {
 
 impl Module for Softmax {
     fn forward(&self, input: Tensor) -> Tensor {
-        let input_ref = input.data_ref();
-        let x = &*input_ref;
-        let shape = x.shape();
+        let (y, output_data) = {
+            let input_ref = input.data_ref();
+            let x = &*input_ref;
+            let shape = x.shape();
 
-        let axis = if self.axis == shape.len() - 1 {
-            self.axis
-        } else {
-            self.axis
+            let axis = if self.axis == shape.len() - 1 {
+                self.axis
+            } else {
+                self.axis
+            };
+
+            let last_dim = shape[axis];
+            let outer_dim = x.len() / last_dim;
+            let x_cow = x.as_standard_layout();
+            let x_2d = x_cow.view().into_shape((outer_dim, last_dim)).unwrap();
+
+            let mut y_flat = Array2::<f32>::zeros((outer_dim, last_dim));
+            Zip::from(y_flat.outer_iter_mut())
+                .and(x_2d.outer_iter())
+                .par_for_each(|mut y_row, x_row| {
+                    let max_val = x_row.fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                    let mut sum = 0.0f32;
+
+                    for (y_val, &x_val) in y_row.iter_mut().zip(x_row.iter()) {
+                        let e = (x_val - max_val).exp();
+                        *y_val = e;
+                        sum += e;
+                    }
+
+                    let inv_sum = 1.0 / sum;
+                    for y_val in y_row.iter_mut() {
+                        *y_val *= inv_sum;
+                    }
+                });
+
+            let y = y_flat.into_shape(shape).unwrap();
+            (y.clone(), y)
         };
+        let build_graph = !is_no_grad() && input.requires_grad();
 
-        let last_dim = shape[axis];
-        let outer_dim = x.len() / last_dim;
-        let x_cow = x.as_standard_layout();
-        let x_2d = x_cow.view().into_shape((outer_dim, last_dim)).unwrap();
-
-        // 2. 预分配输出
-        let mut y_flat = Array2::<f32>::zeros((outer_dim, last_dim));
-
-        // 3. 并行计算 Softmax
-        Zip::from(y_flat.outer_iter_mut())
-            .and(x_2d.outer_iter())
-            .par_for_each(|mut y_row, x_row| {
-                let max_val = x_row.fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-                let mut sum = 0.0f32;
-
-                for (y_val, &x_val) in y_row.iter_mut().zip(x_row.iter()) {
-                    let e = (x_val - max_val).exp();
-                    *y_val = e;
-                    sum += e;
-                }
-
-                let inv_sum = 1.0 / sum;
-                for y_val in y_row.iter_mut() {
-                    *y_val *= inv_sum;
-                }
-            });
-
-        let y = y_flat.into_shape(shape).unwrap();
-        let output_data = y.clone();
+        if !build_graph {
+            return Tensor::from_data_no_grad(y.into_shared());
+        }
 
         let input_clone = input.clone();
         let axis_idx = self.axis;
@@ -246,8 +259,7 @@ impl Module for Softmax {
                     .par_for_each(|mut di_row, y_row, g_row| {
                         let dot: f32 = y_row.iter().zip(g_row.iter()).map(|(&y, &g)| y * g).sum();
 
-                        for (di, (&y, &g)) in di_row.iter_mut().zip(y_row.iter().zip(g_row.iter()))
-                        {
+                        for (di, (&y, &g)) in di_row.iter_mut().zip(y_row.iter().zip(g_row.iter())) {
                             *di = y * (g - dot);
                         }
                     });
@@ -263,7 +275,6 @@ impl Module for Softmax {
     }
 }
 
-// --- Fast GELU ---
 pub struct Gelu;
 impl Gelu {
     pub fn new() -> Self {
@@ -273,15 +284,21 @@ impl Gelu {
 
 impl Module for Gelu {
     fn forward(&self, input: Tensor) -> Tensor {
-        let input_ref = input.data_ref();
-
         const C: f32 = 0.7978845608;
         const K: f32 = 0.044715;
 
-        let output = Zip::from(&*input_ref).par_map_collect(|&x| {
-            let x3 = x * x * x;
-            0.5 * x * (1.0 + (C * (x + K * x3)).tanh())
-        });
+        let output = {
+            let input_ref = input.data_ref();
+            Zip::from(&*input_ref).par_map_collect(|&x| {
+                let x3 = x * x * x;
+                0.5 * x * (1.0 + (C * (x + K * x3)).tanh())
+            })
+        };
+        let build_graph = !is_no_grad() && input.requires_grad();
+
+        if !build_graph {
+            return Tensor::from_data_no_grad(output.into_shared());
+        }
 
         let input_clone = input.clone();
         Tensor(Rc::new(RefCell::new(TensorData {

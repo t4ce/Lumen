@@ -1,10 +1,16 @@
-use crate::autograd::Tensor;
+use crate::autograd::{is_no_grad, Tensor};
 use crate::layers::{Embedding, KVCache, Linear, RMSNorm, SelfAttention, SiLU};
 use crate::layers::attention::self_attention::KVCacheInner;
 use crate::module::Module;
+use crate::ops::fused::fused_gate_up_silu_infer_into;
+use crate::ops::matmul::matvec_argmax_rowmajor_parallel;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+
+thread_local! {
+    static MLP_INTER_BUF: RefCell<Vec<f32>> = RefCell::new(Vec::new());
+}
 
 // Llama 配置参数
 #[derive(Clone, Debug)]
@@ -56,12 +62,49 @@ impl LlamaMLP {
         }
     }
 
+    #[inline]
+    fn should_use_fused_gate_up(x: &Tensor) -> bool {
+        if !is_no_grad() {
+            return false;
+        }
+        let xr = x.data_ref();
+        let shape = xr.shape();
+        let k_dim = *shape.last().expect("MLP input must have last dim");
+        let rows = xr.len() / k_dim;
+        rows == 1
+    }
+
     fn forward(&self, x: Tensor) -> Tensor {
-        let gate = self.gate_proj.forward(x.clone());
-        let gate_act = self.act.forward(gate);
-        let up = self.up_proj.forward(x);
-        let fused = gate_act * up;
-        self.down_proj.forward(fused)
+        if Self::should_use_fused_gate_up(&x) {
+            let inter_dim = self.down_proj.weight.data_ref().shape()[1];
+            return MLP_INTER_BUF.with(|buf| {
+                let mut buf = buf.borrow_mut();
+                if buf.len() < inter_dim {
+                    buf.resize(inter_dim, 0.0);
+                }
+                {
+                    let inter = &mut buf[..inter_dim];
+                    fused_gate_up_silu_infer_into(&x, &self.gate_proj.weight, &self.up_proj.weight, inter);
+                }
+                self.down_proj.forward_decode_slice_no_bias(&buf[..inter_dim])
+            });
+        }
+
+        let gate = {
+            self.gate_proj.forward(x.clone())
+        };
+        let gate_act = {
+            self.act.forward(gate)
+        };
+        let up = {
+            self.up_proj.forward(x)
+        };
+        let fused = {
+            gate_act * up
+        };
+        {
+            self.down_proj.forward(fused)
+        }
     }
 }
 
@@ -175,10 +218,7 @@ impl LlamaModel {
         }
     }
 
-    /// 推理/生成（需要 caches）。
-    ///
-    /// `pos` 参数为了兼容旧调用方保留，但会被忽略：长度由 cache 内部维护。
-    pub fn forward(&self, input_ids: Tensor, caches: &mut Vec<KVCache>, _pos: usize) -> Tensor {
+    fn forward_hidden_infer(&self, input_ids: Tensor, caches: &mut Vec<KVCache>) -> Tensor {
         assert_eq!(
             caches.len(),
             self.layers.len(),
@@ -198,11 +238,114 @@ impl LlamaModel {
             x = y;
         }
 
-        // Final Norm
-        x = self.norm.forward(x);
+        {
+            self.norm.forward(x)
+        }
+    }
 
-        // LM Head
-        self.lm_head.forward(x)
+
+
+    fn lm_head_argmax_from_last_hidden(&self, hidden: &Tensor) -> usize {
+        assert!(is_no_grad(), "forward_last_argmax is inference-only");
+
+        let hidden_ref = hidden.data_ref();
+        let hidden_shape = hidden_ref.shape().to_vec();
+        assert_eq!(hidden_shape.len(), 3, "hidden states must be [B,S,H]");
+        let (b, s, h) = (hidden_shape[0], hidden_shape[1], hidden_shape[2]);
+        assert_eq!(b, 1, "lm_head_argmax currently expects batch size 1");
+        assert!(s >= 1, "sequence length must be >= 1");
+
+        let weight_arc = self.lm_head.weight.data_arc();
+        let weight2 = weight_arc
+            .view()
+            .into_dimensionality::<ndarray::Ix2>()
+            .expect("lm_head weight must be [V,H]");
+        let (_vocab, in_features) = weight2.dim();
+        assert_eq!(in_features, h, "lm_head in_features mismatch");
+
+        let weight_slice = weight2
+            .as_slice()
+            .expect("lm_head weight must be contiguous row-major");
+
+        if s == 1 {
+            if let Some(hidden_slice) = hidden_ref.as_slice() {
+                assert_eq!(hidden_slice.len(), h, "last hidden width mismatch");
+                matvec_argmax_rowmajor_parallel(hidden_slice, weight_slice, weight2.nrows(), in_features)
+            } else {
+                let hidden_owned = hidden_ref.iter().copied().collect::<Vec<f32>>();
+                assert_eq!(hidden_owned.len(), h, "last hidden width mismatch");
+                matvec_argmax_rowmajor_parallel(hidden_owned.as_slice(), weight_slice, weight2.nrows(), in_features)
+            }
+        } else {
+            let hidden3 = hidden_ref
+                .view()
+                .into_dimensionality::<ndarray::Ix3>()
+                .expect("hidden states must be [B,S,H]");
+            let last = hidden3.slice(ndarray::s![0, s - 1, ..]);
+            if let Some(hidden_slice) = last.as_slice() {
+                assert_eq!(hidden_slice.len(), h, "last hidden width mismatch");
+                matvec_argmax_rowmajor_parallel(hidden_slice, weight_slice, weight2.nrows(), in_features)
+            } else {
+                let hidden_owned = last.iter().copied().collect::<Vec<f32>>();
+                assert_eq!(hidden_owned.len(), h, "last hidden width mismatch");
+                matvec_argmax_rowmajor_parallel(hidden_owned.as_slice(), weight_slice, weight2.nrows(), in_features)
+            }
+        }
+    }
+
+    /// 推理/生成（需要 caches）。
+    ///
+    /// `pos` 参数为了兼容旧调用方保留，但会被忽略：长度由 cache 内部维护。
+    pub fn forward(&self, input_ids: Tensor, caches: &mut Vec<KVCache>, _pos: usize) -> Tensor {
+        let x = self.forward_hidden_infer(input_ids, caches);
+
+        {
+            self.lm_head.forward(x)
+        }
+    }
+
+    /// 生成/benchmark 专用：只返回最后一个位置的 logits。
+    ///
+    /// - prefill(S>1) 时，避免对整段序列都跑 lm_head
+    /// - decode(S=1) 时，等价于普通 forward
+    pub fn forward_last_logits(&self, input_ids: Tensor, caches: &mut Vec<KVCache>, _pos: usize) -> Tensor {
+        let x = self.forward_hidden_infer(input_ids, caches);
+
+        let x_shape = x.data_ref().shape().to_vec();
+        assert_eq!(x_shape.len(), 3, "hidden states must be [B,S,H]");
+        let (b, s, h) = (x_shape[0], x_shape[1], x_shape[2]);
+
+        let last_hidden = if s == 1 {
+            x
+        } else {
+            let x_ref = x.data_ref();
+            let x3 = x_ref
+                .view()
+                .into_dimensionality::<ndarray::Ix3>()
+                .expect("hidden states must be [B,S,H]");
+            let last = x3
+                .slice(ndarray::s![.., s - 1..s, ..])
+                .to_owned()
+                .into_dyn();
+            Tensor::from_array_no_grad(last)
+        };
+
+        debug_assert_eq!(last_hidden.data_ref().shape(), &[b, 1, h]);
+
+        {
+            self.lm_head.forward(last_hidden)
+        }
+    }
+
+
+
+    /// 生成/benchmark 热路径：直接返回最后一个位置的 greedy argmax token。
+    ///
+    /// - decode(S=1) 时，避免物化 [1,1,V] logits Tensor
+    /// - prefill(S>1) 时，也只扫描最后一个位置对应的 hidden
+    pub fn forward_last_argmax(&self, input_ids: Tensor, caches: &mut Vec<KVCache>, _pos: usize) -> usize {
+        let x = self.forward_hidden_infer(input_ids, caches);
+        self.lm_head_argmax_from_last_hidden(&x)
     }
 
     /// 训练（不使用 cache，支持 autograd）。
@@ -211,8 +354,12 @@ impl LlamaModel {
         for layer in self.layers.iter() {
             x = layer.forward_train(x);
         }
-        x = self.norm.forward(x);
-        self.lm_head.forward(x)
+        x = {
+            self.norm.forward(x)
+        };
+        {
+            self.lm_head.forward(x)
+        }
     }
 
     pub fn named_parameters(&self) -> HashMap<String, Tensor> {

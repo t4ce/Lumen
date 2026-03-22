@@ -1,10 +1,10 @@
-use crate::autograd::{Tensor, TensorData};
-use crate::module::Module;
+use crate::autograd::{is_no_grad, Tensor, TensorData};
 use crate::init::{tensor_init, InitType};
+use crate::module::Module;
 use ndarray::{Array, Zip};
-use std::rc::Rc;
 use std::cell::RefCell;
 use std::ops::AddAssign;
+use std::rc::Rc;
 
 pub struct Embedding {
     pub weight: Tensor,
@@ -19,26 +19,24 @@ impl Embedding {
     }
 
     pub fn forward(&self, indices: &Tensor) -> Tensor {
-        // 重要：并行闭包中不能捕获 Ref<'_>（不是 Sync）。
-        // 使用 ArcArray clone（仅增 refcount，不拷贝数据），可安全跨线程。
         let w_data = self.weight.data_arc();
-        // Use ArcArray clone to avoid capturing RefCell borrow guards in rayon closures.
         let idx_data = indices.data_arc();
         let e_dim = self.embed_dim;
         let v_size = self.vocab_size;
 
-        // 1. 准备输出形状 [Batch, Seq, Dim]
         let mut out_shape = idx_data.shape().to_vec();
         out_shape.push(e_dim);
         let mut out = Array::zeros(out_shape);
 
-        // 2. 将数据展平以便进行并行处理
         let num_elements = idx_data.len();
         let idx_flat = idx_data
             .view()
             .into_shape(num_elements)
             .expect("Flatten indices failed");
-        let mut out_flat = out.view_mut().into_shape((num_elements, e_dim)).expect("Flatten output failed");
+        let mut out_flat = out
+            .view_mut()
+            .into_shape((num_elements, e_dim))
+            .expect("Flatten output failed");
 
         let w_2d = w_data
             .into_dimensionality::<ndarray::Ix2>()
@@ -56,14 +54,20 @@ impl Embedding {
                 }
             });
 
-        // 4. 构建反向传播闭包
+        let out_dyn = out.into_dyn();
+        let build_graph = !is_no_grad() && self.weight.requires_grad();
+
+        if !build_graph {
+            return Tensor::from_array_no_grad(out_dyn);
+        }
+
         let indices_clone = indices.clone();
         let w_clone = self.weight.clone();
         let v_snap = v_size;
         let e_snap = e_dim;
 
         Tensor(Rc::new(RefCell::new(TensorData {
-            data: out.into_dyn().into_shared(),
+            data: out_dyn.into_shared(),
             grad: None,
             parents: vec![indices.clone(), self.weight.clone()],
             backward_op: Some(Box::new(move |grad| {
@@ -75,17 +79,22 @@ impl Embedding {
                 for (i, &idx_f32) in idx_flat.iter().enumerate() {
                     let idx = idx_f32 as usize;
                     if idx < v_snap {
-                        d_w.slice_mut(ndarray::s![idx, ..]).add_assign(&grad_2d.slice(ndarray::s![i, ..]));
+                        d_w.slice_mut(ndarray::s![idx, ..])
+                            .add_assign(&grad_2d.slice(ndarray::s![i, ..]));
                     }
                 }
                 w_clone.add_grad(d_w.into_dyn());
             })),
-            requires_grad: true
+            requires_grad: true,
         })))
     }
 }
 
 impl Module for Embedding {
-    fn forward(&self, x: Tensor) -> Tensor { self.forward(&x) }
-    fn parameters(&self) -> Vec<Tensor> { vec![self.weight.clone()] }
+    fn forward(&self, x: Tensor) -> Tensor {
+        self.forward(&x)
+    }
+    fn parameters(&self) -> Vec<Tensor> {
+        vec![self.weight.clone()]
+    }
 }
