@@ -77,7 +77,7 @@ pub fn fused_softmax(input: &Tensor, scale: f32, is_causal: bool) -> Tensor {
         data: output.into_shared(),
         grad: None,
         parents: vec![input.clone()],
-        backward_op: Some(Box::new(move |grad| {
+        backward_op: Some(std::rc::Rc::new(move |grad| {
             let y = &output_data;
             let y_grad = y * grad;
             let sum_y_grad = y_grad.sum_axis(Axis(3)).insert_axis(Axis(3));

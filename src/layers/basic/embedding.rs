@@ -70,7 +70,7 @@ impl Embedding {
             data: out_dyn.into_shared(),
             grad: None,
             parents: vec![indices.clone(), self.weight.clone()],
-            backward_op: Some(Box::new(move |grad| {
+            backward_op: Some(std::rc::Rc::new(move |grad| {
                 let binding = indices_clone.data_ref();
                 let idx_flat = binding.view().into_shape(num_elements).unwrap();
                 let grad_2d = grad.view().into_shape((num_elements, e_snap)).unwrap();

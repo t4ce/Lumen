@@ -76,7 +76,7 @@ impl LlamaMLP {
 
     fn forward(&self, x: Tensor) -> Tensor {
         if Self::should_use_fused_gate_up(&x) {
-            let inter_dim = self.down_proj.weight.data_ref().shape()[1];
+            let inter_dim = self.down_proj.in_features;
             return MLP_INTER_BUF.with(|buf| {
                 let mut buf = buf.borrow_mut();
                 if buf.len() < inter_dim {

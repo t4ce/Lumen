@@ -475,7 +475,7 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
         grad: None,
         parents: vec![a_clone.clone(), b_clone.clone()],
         requires_grad: true,
-        backward_op: Some(Box::new(move |grad: &ndarray::ArrayViewD<f32>| {
+        backward_op: Some(std::rc::Rc::new(move |grad: &ndarray::ArrayViewD<f32>| {
             let g_len = grad.len();
             let g_m = g_len / n_dim;
 
@@ -559,7 +559,7 @@ pub fn batch_matmul(lhs: &Tensor, rhs: &Tensor) -> Tensor {
         data: output_dyn.into_shared(),
         grad: None,
         parents: vec![lhs_clone.clone(), rhs_clone.clone()],
-        backward_op: Some(Box::new(move |grad: &ndarray::ArrayViewD<f32>| {
+        backward_op: Some(std::rc::Rc::new(move |grad: &ndarray::ArrayViewD<f32>| {
             let grad_view = grad.view().into_dimensionality::<Ix4>().unwrap();
             let l_data = lhs_clone.0.borrow().data.clone();
             let r_data = rhs_clone.0.borrow().data.clone();
