@@ -1,6 +1,6 @@
 # Lumen
 
-> A lightweight deep learning core written in Rust, featuring dynamic autograd, modular neural network components, and a CPU-oriented Llama inference path.
+> A lightweight deep learning core written in Rust, featuring dynamic autograd, flexible dtype management, quantization-aware loading, and a CPU-oriented Llama inference path.
 
 [中文 README](./README_zh-CN.md) · [Repository README](./README.md)
 
@@ -8,36 +8,41 @@
 
 ## Overview
 
-Lumen is a compact Rust deep learning project. This release keeps the **core library** and a **minimal runnable Llama inference example**, while removing development-time test, benchmark, timing, and sweep code.
+Lumen is a compact Rust deep learning project. The current release keeps:
+
+- a reusable **core library** for tensors, autograd, layers, modules, losses, and optimizers;
+- a **minimal runnable Llama inference CLI** in `src/main.rs`;
+- an **offline safetensors quantization utility**;
+- an optional **development-only benchmark tool** isolated behind a Cargo feature instead of shipping as a default release binary.
 
 The repository is useful in two ways:
 
-- as a **learning-oriented DL core** for understanding tensors, autograd, layers, modules, and optimizers in Rust;
-- as a **small LLM inference skeleton** showing a Llama-style model, safetensors loading, tokenizer integration, and KV-cache-based incremental decoding.
+- as a **learning-oriented DL core** for understanding tensors, autograd, modules, and kernels in Rust;
+- as a **small LLM inference skeleton** showing a Llama-style decoder, safetensors loading, tokenizer integration, KV-cache decoding, and low-memory loading options.
 
-> `src/main.rs` is **just a simple example program**. Its purpose is to demonstrate how the library pieces are wired together for local inference. It is **not** intended to be a full production CLI, serving stack, or universal model runner.
+`src/main.rs` is intentionally a **small integration example**, not a full production CLI, serving stack, or universal launcher.
 
 ---
 
 ## Technical Highlights
 
-- **Dynamic autograd engine** built around tensor-based graph construction
-- **`Module`-style abstraction** for organizing trainable components
-- **Separated layer / op design** for cleaner modeling and easier kernel evolution
-- **Llama-family decoder implementation**, including:
-  - RMSNorm
-  - RoPE
-  - causal self-attention
-  - GQA via `num_key_value_heads`
-  - SwiGLU-style MLP
-  - incremental decoding with **KV cache**
-- **CPU-oriented inference hot-path optimization**, including:
-  - Rayon-backed parallel execution
-  - row-major parallel matvec path for decode
-  - fused infer-time gate/up/SiLU path in the MLP
-  - release profile tuned with `lto`, `panic = "abort"`, and `strip`
-- **Efficient checkpoint loading** through `safetensors` + `memmap2`
-- **Tokenizer integration** via Hugging Face `tokenizers`
+- Dynamic autograd engine built around tensor-based graph construction
+- `Module`-style abstraction for trainable components
+- Separated layer / op design for cleaner modeling and kernel evolution
+- Flexible precision system with:
+  - global defaults plus local overrides
+  - separate parameter dtype and runtime dtype
+  - optional cached parameter dtype copies
+- Storage and loading support for `f32`, `f16`, `bf16`, and `i8`
+- Quantization-aware parameter handling:
+  - direct float-to-`i8` quantized loading
+  - post-load parameter quantization
+  - automatic or manual quantization scale
+- Llama-family decoder implementation with RMSNorm, RoPE, causal self-attention, GQA, SwiGLU-style MLP, and KV-cache incremental decoding
+- CPU-oriented inference hot-path optimization
+- Safetensors loading through both memory-mapped and streamed paths
+- Hugging Face `tokenizers` integration
+- Release profile tuned with `lto`, `panic = "abort"`, and `strip`
 
 ---
 
@@ -45,18 +50,21 @@ The repository is useful in two ways:
 
 ```text
 src/
-├─ autograd.rs          # Tensor + dynamic autograd core
-├─ module.rs            # Module trait/macros
-├─ ops/                 # Tensor ops and low-level kernels
-├─ layers/              # NN layers and attention components
-├─ models/llama.rs      # Llama model implementation
-├─ loader.rs            # Safetensors weight loading
-├─ tokenizer.rs         # Hugging Face tokenizer wrapper
-├─ kv_cache.rs          # Legacy/simple KV cache implementation
-├─ optim.rs             # Optimizers
-├─ loss.rs              # Loss functions
-├─ init.rs              # Parameter initialization helpers
-└─ main.rs              # Minimal local inference example
+├─ autograd.rs                  # Tensor + dynamic autograd core
+├─ module.rs                    # Module trait/macros
+├─ ops/                         # Tensor ops and kernels
+├─ layers/                      # NN layers and attention components
+├─ models/llama.rs              # Llama model implementation
+├─ loader.rs                    # Safetensors loading and streamed loading
+├─ tokenizer.rs                 # Hugging Face tokenizer wrapper
+├─ kv_cache.rs                  # Legacy/simple KV cache implementation
+├─ optim.rs                     # Optimizers
+├─ loss.rs                      # Loss functions
+├─ init.rs                      # Parameter initialization helpers
+├─ main.rs                      # Minimal local inference CLI
+└─ bin/
+   ├─ quantize_safetensors.rs   # Offline quantization utility
+   └─ kernel_bench.rs           # Dev-only benchmark tool
 ```
 
 ---
@@ -82,26 +90,56 @@ $env:RUSTFLAGS = "-C target-cpu=native"
 cargo build --release
 ```
 
----
+Default release builds ship the user-facing binaries:
 
-## Running the Minimal Example
+- `lumen`
+- `quantize_safetensors`
 
-The example program expects explicit weight and tokenizer paths:
+The benchmark binary is intentionally excluded from default builds. To build it:
 
 ```bash
-cargo run --release -- \
+cargo build --release --features dev-tools --bin kernel_bench
+```
+
+---
+
+## Running the Example
+
+Run the example CLI with explicit weight and tokenizer paths:
+
+```bash
+cargo run --release --bin lumen -- \
   --weights path/to/model.safetensors \
   --tokenizer path/to/tokenizer.json
 ```
 
-Optional arguments:
+Useful optional arguments:
 
+- `--parameter-dtype f32|f16|bf16|i8`
+- `--runtime-dtype f32|f16|bf16`
+- `--quantize off|i8`
+- `--quant-scale FLOAT`
+- `--stream-weights`
+- `--allow-parameter-copies`
+- `--max-seq-len N`
 - `--system`
 - `--temperature`
 - `--top-p`
 - `--repetition-penalty`
 - `--recent-window`
 - `--max-gen`
+- `--load-only`
+
+Example: low-memory float checkpoint loading with on-load `i8` quantization:
+
+```bash
+cargo run --release --bin lumen -- \
+  --weights path/to/model.safetensors \
+  --tokenizer path/to/tokenizer.json \
+  --runtime-dtype bf16 \
+  --quantize i8 \
+  --stream-weights
+```
 
 Interactive commands in the example chat loop:
 
@@ -110,9 +148,44 @@ Interactive commands in the example chat loop:
 
 ---
 
+## Offline Quantization Utility
+
+To generate a quantized safetensors checkpoint ahead of time:
+
+```bash
+cargo run --release --bin quantize_safetensors -- \
+  --input path/to/model.safetensors \
+  --output path/to/model.i8.safetensors \
+  --dtype i8
+```
+
+Optional manual scale:
+
+```bash
+cargo run --release --bin quantize_safetensors -- \
+  --input path/to/model.safetensors \
+  --output path/to/model.i8.safetensors \
+  --dtype i8 \
+  --scale 0.02
+```
+
+---
+
+## Benchmark Tool
+
+Kernel benchmarks are still kept in the repository, but they are now isolated as a development tool rather than a default release artifact:
+
+```bash
+cargo run --release --features dev-tools --bin kernel_bench -- --iters 200 --samples 5
+```
+
+This keeps the release build smaller while preserving the benchmark workflow for kernel work.
+
+---
+
 ## Important Note on `main.rs`
 
-`src/main.rs` uses a **hard-coded `model_config()`** and a very lightweight CLI flow. This is intentional: it keeps the example easy to inspect and modify.
+`src/main.rs` uses a **hard-coded `model_config()`** and a lightweight CLI flow. This is intentional: it keeps the example easy to inspect and modify.
 
 But it also means:
 
@@ -128,12 +201,13 @@ So, **`main.rs` should be understood as a simple integration example, not a univ
 
 Many Rust ML repositories stop at tensors or MLP demos. Lumen goes further by connecting multiple layers of the stack in one codebase:
 
-- tensor + autograd fundamentals,
-- reusable NN modules,
-- a Llama decoder implementation,
-- checkpoint loading,
-- tokenizer bridging,
-- stateful autoregressive decoding.
+- tensor + autograd fundamentals
+- reusable NN modules
+- dtype-aware parameter storage
+- quantization-aware checkpoint loading
+- a Llama decoder implementation
+- tokenizer bridging
+- stateful autoregressive decoding
 
 That makes it a solid starting point for studying how a small Rust-native DL / LLM runtime can be assembled end to end.
 
