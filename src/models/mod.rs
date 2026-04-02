@@ -1,2 +1,2 @@
 pub mod llama;
-pub use llama::{LlamaModel, LlamaConfig};
+pub use llama::{LlamaConfig, LlamaModel};

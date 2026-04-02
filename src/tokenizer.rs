@@ -1,6 +1,6 @@
-use tokenizers::Tokenizer as HFTokenizer;
-use std::path::Path;
 use std::error::Error;
+use std::path::Path;
+use tokenizers::Tokenizer as HFTokenizer;
 
 pub struct LlamaTokenizer {
     inner: HFTokenizer,
@@ -8,13 +8,16 @@ pub struct LlamaTokenizer {
 
 impl LlamaTokenizer {
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn Error>> {
-        let tokenizer = HFTokenizer::from_file(path)
-            .map_err(|e| Box::<dyn Error>::from(e.to_string()))?;
+        let tokenizer =
+            HFTokenizer::from_file(path).map_err(|e| Box::<dyn Error>::from(e.to_string()))?;
         Ok(Self { inner: tokenizer })
     }
 
     pub fn encode(&self, text: &str, with_special_tokens: bool) -> Vec<usize> {
-        let encoding = self.inner.encode(text, with_special_tokens).expect("Tokenization failed");
+        let encoding = self
+            .inner
+            .encode(text, with_special_tokens)
+            .expect("Tokenization failed");
         encoding.get_ids().iter().map(|&id| id as usize).collect()
     }
 

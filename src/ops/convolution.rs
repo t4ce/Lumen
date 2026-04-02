@@ -1,7 +1,10 @@
 // src/ops/convolution.rs
 use crate::autograd::{Tensor, TensorData};
 use ndarray::linalg::general_mat_mul;
-use ndarray::{s, Array, Array2, ArrayBase, ArrayD, ArrayView2, ArrayView3, ArrayViewD, ArrayViewMut2, Axis, Data, IxDyn, Zip};
+use ndarray::{
+    Array, ArrayBase, ArrayD, ArrayView2, ArrayView3, ArrayViewD, ArrayViewMut2, Axis, Data, IxDyn,
+    Zip, s,
+};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -83,57 +86,6 @@ fn im2col_2d_fast_into(
             col_idx += 1;
         }
     }
-}
-
-// Input: [Cin*KH*KW, Hout*Wout] -> Accumulate to: [Cin, H, W]
-// 这是一个累加过程 (+=)，因为多个卷积窗口可能重叠在同一个输入像素上
-fn col2im_2d_fast(
-    col: &Array2<f32>,
-    input_shape: (usize, usize, usize), // (Cin, H, W)
-    kernel_size: (usize, usize),
-    stride: (usize, usize),
-    out_dim: (usize, usize),
-) -> Array<f32, ndarray::Ix3> {
-    let (cin, h_in, w_in) = input_shape;
-    let (kh, kw) = kernel_size;
-    let (sh, sw) = stride;
-    let (hout, wout) = out_dim;
-
-    let mut img = Array::<f32, ndarray::Ix3>::zeros((cin, h_in, w_in));
-
-    let img_ptr = img.as_mut_ptr();
-    let img_strides = img.strides();
-    let s_c = img_strides[0];
-    let s_h = img_strides[1];
-    let s_w = img_strides[2];
-
-    // 我们遍历 col 的每一列 (对应一个输出像素)
-    let mut col_idx = 0;
-    for y in 0..hout {
-        let h_base = (y * sh) as isize * s_h;
-        for x in 0..wout {
-            let w_base = (x * sw) as isize * s_w;
-
-            let mut row_idx = 0;
-            for ic in 0..cin {
-                let c_offset = ic as isize * s_c;
-                for ky in 0..kh {
-                    let h_offset = h_base + ky as isize * s_h;
-                    for kx in 0..kw {
-                        let w_offset = w_base + kx as isize * s_w;
-                        unsafe {
-                            let val = *col.uget((row_idx, col_idx));
-                            // img += val
-                            *img_ptr.offset(c_offset + h_offset + w_offset) += val;
-                        }
-                        row_idx += 1;
-                    }
-                }
-            }
-            col_idx += 1;
-        }
-    }
-    img
 }
 
 // View 版本：避免为了 col2im 再分配一个 Array2。
@@ -242,10 +194,12 @@ pub fn conv2d(
                         out_buf.resize(out_channels * out_pixels, 0.0);
                     }
 
-                    let mut col_view = ArrayViewMut2::from_shape((k_dim, out_pixels), &mut col_buf[..])
-                        .expect("im2col buffer shape mismatch");
-                    let mut out_view = ArrayViewMut2::from_shape((out_channels, out_pixels), &mut out_buf[..])
-                        .expect("out buffer shape mismatch");
+                    let mut col_view =
+                        ArrayViewMut2::from_shape((k_dim, out_pixels), &mut col_buf[..])
+                            .expect("im2col buffer shape mismatch");
+                    let mut out_view =
+                        ArrayViewMut2::from_shape((out_channels, out_pixels), &mut out_buf[..])
+                            .expect("out buffer shape mismatch");
 
                     // im2col into preallocated buffer
                     im2col_2d_fast_into(
@@ -286,6 +240,14 @@ pub fn conv2d(
 
     Tensor(Rc::new(RefCell::new(TensorData {
         data: output_dyn.into_shared(),
+        f16_data: None,
+        bf16_data: None,
+        i8_data: None,
+        i8_scale: None,
+        has_f32_data: true,
+        storage_dtype: crate::precision::DType::F32,
+        cache_dirty: false,
+        is_parameter: false,
         grad: None,
         parents: if let Some(b) = &bias_clone {
             vec![input.clone(), weight.clone(), b.clone()]
@@ -308,7 +270,7 @@ pub fn conv2d(
 }
 
 fn run_backward_conv2d_gemm(
-    grad_output: &ArrayViewD<'_ , f32>,
+    grad_output: &ArrayViewD<'_, f32>,
     input: &Tensor,
     weight: &Tensor,
     bias: Option<&Tensor>,
@@ -368,18 +330,19 @@ fn run_backward_conv2d_gemm(
                 if dcol_buf.len() != k_dim * out_pixels {
                     dcol_buf.resize(k_dim * out_pixels, 0.0);
                 }
-                let mut d_col_view = ArrayViewMut2::from_shape((k_dim, out_pixels), &mut dcol_buf[..])
-                    .expect("dcol buffer shape mismatch");
+                let mut d_col_view =
+                    ArrayViewMut2::from_shape((k_dim, out_pixels), &mut dcol_buf[..])
+                        .expect("dcol buffer shape mismatch");
                 d_col_view.fill(0.0);
                 general_mat_mul(1.0, &w_col_t, &g_out_col, 0.0, &mut d_col_view);
 
                 // Col2Im: dCol -> dX_padded (view 版本避免分配)
                 let d_im = col2im_2d_fast_view(
                     &d_col_view.view(),
-                (in_c, x_pad_4d.shape()[2], x_pad_4d.shape()[3]),
-                (kh, kw),
-                (sh, sw),
-                (out_h, out_w),
+                    (in_c, x_pad_4d.shape()[2], x_pad_4d.shape()[3]),
+                    (kh, kw),
+                    (sh, sw),
+                    (out_h, out_w),
                 );
 
                 g_in_sample.assign(&d_im);
@@ -422,9 +385,16 @@ fn run_backward_conv2d_gemm(
                         dw_buf.resize(out_c * k_dim, 0.0);
                     }
 
-                    let mut col_view = ArrayViewMut2::from_shape((k_dim, out_pixels), &mut col_buf[..])
-                        .expect("im2col buffer shape mismatch (bwd)");
-                    im2col_2d_fast_into(&x_sample, (kh, kw), (sh, sw), (out_h, out_w), col_view.view_mut());
+                    let mut col_view =
+                        ArrayViewMut2::from_shape((k_dim, out_pixels), &mut col_buf[..])
+                            .expect("im2col buffer shape mismatch (bwd)");
+                    im2col_2d_fast_into(
+                        &x_sample,
+                        (kh, kw),
+                        (sh, sw),
+                        (out_h, out_w),
+                        col_view.view_mut(),
+                    );
 
                     let mut dw_view = ArrayViewMut2::from_shape((out_c, k_dim), &mut dw_buf[..])
                         .expect("dw buffer shape mismatch");
@@ -517,6 +487,14 @@ pub fn max_pool2d(input: &Tensor, kernel_size: (usize, usize), stride: (usize, u
     let input_clone = input.clone();
     Tensor(Rc::new(RefCell::new(TensorData {
         data: output.into_shared(),
+        f16_data: None,
+        bf16_data: None,
+        i8_data: None,
+        i8_scale: None,
+        has_f32_data: true,
+        storage_dtype: crate::precision::DType::F32,
+        cache_dirty: false,
+        is_parameter: false,
         grad: None,
         parents: vec![input.clone()],
         backward_op: Some(std::rc::Rc::new(move |grad_output| {

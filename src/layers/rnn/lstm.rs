@@ -3,6 +3,7 @@ use crate::layers::Linear;
 use crate::layers::activation::{Sigmoid, Tanh};
 use crate::module::Module;
 use crate::ops::shape::slice_last_dim;
+use crate::precision::{DType, default_parameter_quantization};
 use ndarray::s;
 
 pub struct LSTM {
@@ -17,15 +18,46 @@ impl LSTM {
     pub fn new(input_size: usize, hidden_size: usize) -> Self {
         let w_x = Linear::new(input_size, 4 * hidden_size);
         let w_h = Linear::new(hidden_size, 4 * hidden_size);
+
+        if let Some(bias_tensor) = &w_x.bias {
+            let mut bias_view = bias_tensor.data_mut();
+            bias_view
+                .slice_mut(s![hidden_size..2 * hidden_size])
+                .mapv_inplace(|_| 1.0);
+            let dtype = bias_tensor.dtype();
+            if dtype.is_integer() {
+                let quantization = default_parameter_quantization();
+                if quantization.is_enabled() && quantization.storage_dtype() == Some(dtype) {
+                    bias_tensor.quantize_inplace_with_quantization(quantization);
+                } else {
+                    bias_tensor.cast_inplace(dtype);
+                }
+            } else {
+                bias_tensor.cast_inplace(dtype);
+            }
+        }
+
+        LSTM {
+            hidden_size,
+            w_x,
+            w_h,
+            sigmoid: Sigmoid::new(),
+            tanh: Tanh::new(),
+        }
+    }
+
+    pub fn new_with_dtype(input_size: usize, hidden_size: usize, dtype: DType) -> Self {
+        let w_x = Linear::new_with_dtype(input_size, 4 * hidden_size, dtype);
+        let w_h = Linear::new_with_dtype(hidden_size, 4 * hidden_size, dtype);
         // 我们的切分顺序是: [Input, Forget, Cell, Output]
         // 所以 Forget Gate 在索引 [hidden_size .. 2*hidden_size]
 
         if let Some(bias_tensor) = &w_x.bias {
-            let mut inner = bias_tensor.0.borrow_mut();
-            let mut bias_view = inner.data.view_mut();
+            let mut bias_view = bias_tensor.data_mut();
             bias_view
                 .slice_mut(s![hidden_size..2 * hidden_size])
                 .mapv_inplace(|_| 1.0);
+            bias_tensor.cast_inplace(dtype);
         }
 
         LSTM {

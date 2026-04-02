@@ -1,11 +1,16 @@
 use mimalloc::MiMalloc;
 
-use lumen::autograd::{no_grad, Tensor};
-use lumen::loader::ModelLoader;
+use lumen::autograd::{Tensor, no_grad};
+use lumen::init::{ParameterInitMode, with_parameter_init_mode};
+use lumen::loader::{ModelLoader, WeightLoadOptions};
 use lumen::models::{LlamaConfig, LlamaModel};
+use lumen::precision::{
+    DType, ParameterQuantization, PrecisionConfig, with_parameter_quantization,
+    with_precision_config,
+};
 use lumen::tokenizer::LlamaTokenizer;
 
-use ndarray::{s, Array, Array1, Ix3};
+use ndarray::{Array, Array1, Ix3, s};
 use ndarray_rand::RandomExt;
 use rand_distr::Uniform;
 
@@ -15,20 +20,6 @@ use std::path::Path;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
-
-fn model_config() -> LlamaConfig {
-    LlamaConfig {
-        vocab_size: 32000,
-        hidden_size: 2048,
-        intermediate_size: 5632,
-        num_hidden_layers: 22,
-        num_attention_heads: 32,
-        num_key_value_heads: 4,
-        rms_norm_eps: 1e-5,
-        max_seq_len: 2048,
-        rope_theta: 10000.0,
-    }
-}
 
 #[derive(Debug, Clone)]
 struct Args {
@@ -40,12 +31,54 @@ struct Args {
     repetition_penalty: f32,
     recent_window: usize,
     max_gen: usize,
+    parameter_dtype: DType,
+    runtime_dtype: DType,
+    allow_parameter_copies: bool,
+    parameter_quantization: ParameterQuantization,
+    stream_weights: bool,
+    max_seq_len: usize,
+    load_only: bool,
 }
 
 fn usage(program: &str) {
     eprintln!(
-        "Usage:\n  {program} --weights PATH --tokenizer PATH [options]\n\nOptions:\n  --system TEXT              System prompt\n  --temperature FLOAT        Sampling temperature (default: 0.8)\n  --top-p FLOAT              Top-p nucleus sampling (default: 0.9)\n  --repetition-penalty FLOAT Repetition penalty (default: 1.05)\n  --recent-window N          Recent token window for repetition penalty (default: 96)\n  --max-gen N                Max generated tokens per turn (default: 200)\n\nCommands in chat:\n  /reset   Clear history and KV cache\n  /exit    Quit"
+        "Usage:\n  {program} --weights PATH --tokenizer PATH [options]\n\nOptions:\n  --system TEXT              System prompt\n  --temperature FLOAT        Sampling temperature (default: 0.8)\n  --top-p FLOAT              Top-p nucleus sampling (default: 0.9)\n  --repetition-penalty FLOAT Repetition penalty (default: 1.05)\n  --recent-window N          Recent token window for repetition penalty (default: 96)\n  --max-gen N                Max generated tokens per turn (default: 200)\n  --parameter-dtype DTYPE    Default parameter dtype: f32/f16/bf16/i8 (default: f32)\n  --runtime-dtype DTYPE      Runtime/KV cache dtype: f32/f16/bf16 (default: f32)\n  --quantize DTYPE           Quantize float weights on load: off/i8 (default: off)\n  --quant-scale FLOAT        Manual quantization scale override\n  --allow-parameter-copies   Allow cached parameter dtype copies\n  --stream-weights           Stream weights from disk instead of memory-mapping whole safetensors\n  --max-seq-len N            Override KV cache max sequence length (default: 2048)\n  --load-only                Load model and initialize KV cache, then exit\n\nCommands in chat:\n  /reset   Clear history and KV cache\n  /exit    Quit"
     );
+}
+
+fn model_config(max_seq_len: usize) -> LlamaConfig {
+    LlamaConfig {
+        vocab_size: 32000,
+        hidden_size: 2048,
+        intermediate_size: 5632,
+        num_hidden_layers: 22,
+        num_attention_heads: 32,
+        num_key_value_heads: 4,
+        rms_norm_eps: 1e-5,
+        max_seq_len,
+        rope_theta: 10000.0,
+    }
+}
+
+fn parse_dtype_flag(flag: &str, value: &str, allow_integer: bool) -> Result<DType, String> {
+    let dtype = match value.to_ascii_lowercase().as_str() {
+        "f32" | "float32" => DType::F32,
+        "f16" | "float16" | "half" => DType::F16,
+        "bf16" | "bfloat16" => DType::BF16,
+        "i8" | "int8" => DType::I8,
+        other => {
+            return Err(format!(
+                "{flag} 不支持的 dtype: {other}，可选值为 f32/f16/bf16{}",
+                if allow_integer { "/i8" } else { "" }
+            ));
+        }
+    };
+
+    if !allow_integer && dtype.is_integer() {
+        return Err(format!("{flag} 当前只支持浮点 dtype，不能使用 {:?}", dtype));
+    }
+
+    Ok(dtype)
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -65,6 +98,14 @@ fn parse_args() -> Result<Args, String> {
     let mut repetition_penalty = 1.05f32;
     let mut recent_window = 96usize;
     let mut max_gen = 200usize;
+    let mut parameter_dtype = DType::F32;
+    let mut runtime_dtype = DType::F32;
+    let mut allow_parameter_copies = false;
+    let mut quantize_dtype: Option<DType> = None;
+    let mut quant_scale: Option<f32> = None;
+    let mut stream_weights = false;
+    let mut max_seq_len = 2048usize;
+    let mut load_only = false;
 
     let mut i = 1usize;
     while i < argv.len() {
@@ -125,6 +166,59 @@ fn parse_args() -> Result<Args, String> {
                     .parse::<usize>()
                     .map_err(|_| "--max-gen 需要 usize")?;
             }
+            "--parameter-dtype" => {
+                i += 1;
+                parameter_dtype = parse_dtype_flag(
+                    "--parameter-dtype",
+                    argv.get(i).ok_or("--parameter-dtype 缺少 dtype")?,
+                    true,
+                )?;
+            }
+            "--runtime-dtype" => {
+                i += 1;
+                runtime_dtype = parse_dtype_flag(
+                    "--runtime-dtype",
+                    argv.get(i).ok_or("--runtime-dtype 缺少 dtype")?,
+                    false,
+                )?;
+            }
+            "--quantize" => {
+                i += 1;
+                let raw = argv
+                    .get(i)
+                    .ok_or("--quantize 缺少 dtype，支持 off/i8")?
+                    .to_ascii_lowercase();
+                quantize_dtype = match raw.as_str() {
+                    "off" | "none" | "disabled" => None,
+                    _ => Some(parse_dtype_flag("--quantize", &raw, true)?),
+                };
+            }
+            "--quant-scale" => {
+                i += 1;
+                quant_scale = Some(
+                    argv.get(i)
+                        .ok_or("--quant-scale 缺少数字")?
+                        .parse::<f32>()
+                        .map_err(|_| "--quant-scale 需要 f32")?,
+                );
+            }
+            "--allow-parameter-copies" => {
+                allow_parameter_copies = true;
+            }
+            "--stream-weights" => {
+                stream_weights = true;
+            }
+            "--max-seq-len" => {
+                i += 1;
+                max_seq_len = argv
+                    .get(i)
+                    .ok_or("--max-seq-len 缺少数字")?
+                    .parse::<usize>()
+                    .map_err(|_| "--max-seq-len 需要 usize")?;
+            }
+            "--load-only" => {
+                load_only = true;
+            }
             other => return Err(format!("未知参数: {other}")),
         }
         i += 1;
@@ -139,6 +233,41 @@ fn parse_args() -> Result<Args, String> {
     if repetition_penalty < 1.0 {
         return Err("--repetition-penalty 不能小于 1.0".to_string());
     }
+    if max_seq_len == 0 {
+        return Err("--max-seq-len 必须 > 0".to_string());
+    }
+    if let Some(scale) = quant_scale {
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err("--quant-scale 必须是有限且 > 0 的 f32".to_string());
+        }
+    }
+    if let Some(dtype) = quantize_dtype {
+        if !dtype.is_integer() {
+            return Err(format!(
+                "--quantize 当前只支持整数存储 dtype，收到 {:?}",
+                dtype
+            ));
+        }
+        if parameter_dtype != DType::F32 && parameter_dtype != dtype {
+            return Err(format!(
+                "--parameter-dtype={:?} 与 --quantize={:?} 冲突；量化开启时请设为默认 f32 或与量化 dtype 一致",
+                parameter_dtype, dtype
+            ));
+        }
+    } else if quant_scale.is_some() {
+        return Err("--quant-scale 只有在 --quantize 开启时才可使用".to_string());
+    }
+
+    let parameter_quantization = match quantize_dtype {
+        Some(dtype) => {
+            let quant = ParameterQuantization::new(dtype);
+            match quant_scale {
+                Some(scale) => quant.with_scale(scale),
+                None => quant,
+            }
+        }
+        None => ParameterQuantization::Disabled,
+    };
 
     Ok(Args {
         weights: weights.ok_or("必须提供 --weights")?,
@@ -149,6 +278,13 @@ fn parse_args() -> Result<Args, String> {
         repetition_penalty,
         recent_window,
         max_gen,
+        parameter_dtype,
+        runtime_dtype,
+        allow_parameter_copies,
+        parameter_quantization,
+        stream_weights,
+        max_seq_len,
+        load_only,
     })
 }
 
@@ -287,7 +423,7 @@ fn last_step_logits_vec(logits: &Tensor) -> Vec<f32> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args().map_err(|e| format!("参数错误: {e}"))?;
-    let config = model_config();
+    let config = model_config(args.max_seq_len);
 
     if !Path::new(&args.tokenizer).exists() {
         return Err(format!("tokenizer 文件不存在: {}", args.tokenizer).into());
@@ -297,6 +433,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("🦀 Loading Rusty Llama...");
+    println!(
+        "⚙️  parameter_dtype={:?} runtime_dtype={:?} quantization={:?} allow_parameter_copies={} stream_weights={} max_seq_len={}",
+        args.parameter_dtype,
+        args.runtime_dtype,
+        args.parameter_quantization,
+        args.allow_parameter_copies,
+        args.stream_weights,
+        args.max_seq_len
+    );
     let tokenizer = LlamaTokenizer::from_file(&args.tokenizer)?;
     if tokenizer.vocab_size() != config.vocab_size {
         return Err(format!(
@@ -307,9 +452,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
-    let model = LlamaModel::new(config.clone());
-    println!("📦 Loading weights from: {}", args.weights);
-    ModelLoader::load_llama_weights(&args.weights, &model.named_parameters())?;
+    let precision_config = PrecisionConfig {
+        parameter_dtype: args.parameter_dtype,
+        runtime_dtype: args.runtime_dtype,
+        allow_parameter_dtype_copies: args.allow_parameter_copies,
+    };
+    let load_options = WeightLoadOptions {
+        float_source_quantization: args.parameter_quantization,
+        stream_from_disk: args.stream_weights,
+    };
+    let model = with_precision_config(precision_config, || {
+        with_parameter_quantization(args.parameter_quantization, || {
+            let model = with_parameter_init_mode(ParameterInitMode::Placeholder, || {
+                LlamaModel::new(config.clone())
+            });
+            println!("📦 Loading weights from: {}", args.weights);
+            ModelLoader::load_llama_weights_with_options(
+                &args.weights,
+                &model.named_parameters(),
+                load_options,
+            )?;
+            Ok::<LlamaModel, Box<dyn std::error::Error>>(model)
+        })
+    })?;
 
     println!("\n✨ System Ready. Commands: /reset  /exit");
 
@@ -333,6 +498,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut kv_caches = model.init_kv_caches(1);
     model.reset_kv_caches(&mut kv_caches);
+
+    if args.load_only {
+        println!("✅ load-only complete.");
+        return Ok(());
+    }
 
     loop {
         print!("\n👤 User: ");
@@ -378,7 +548,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if cur_len + new_tokens.len() + args.max_gen + 8 >= config.max_seq_len {
                 all_tokens.clear();
                 model.reset_kv_caches(&mut kv_caches);
-                first_turn = true;
 
                 let prompt2 = build_first_turn_prompt(&args.system, user_msg);
                 new_tokens = tokenizer.encode(&prompt2, false);
@@ -392,11 +561,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             all_tokens.extend_from_slice(&new_tokens);
             let assistant_start = all_tokens.len();
 
-            let prefill_logits = model.forward_last_logits(
-                tensor_from_token_ids(&new_tokens),
-                &mut kv_caches,
-                0,
-            );
+            let prefill_logits =
+                model.forward_last_logits(tensor_from_token_ids(&new_tokens), &mut kv_caches, 0);
             let mut logits_vec = last_step_logits_vec(&prefill_logits);
 
             let mut prev_gen_text = String::new();
