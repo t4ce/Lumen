@@ -1,12 +1,16 @@
 [package]
 name = "lumen"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 autobins = false
 
 [features]
 default = []
 dev-tools = []
+arm64-int8-kernels = []
+x86-int8-kernels = []
+arm64-fp-kernels = []
+x86-fp-kernels = []
 
 [dependencies]
 ndarray = { version = "0.15", features = ["rayon"] }

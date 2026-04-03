@@ -119,6 +119,8 @@ Useful optional arguments:
 
 - `--parameter-dtype f32|f16|bf16|i8`
 - `--runtime-dtype f32|f16|bf16`
+- `--activation-dtype f32|f16|bf16`
+- `--kv-cache-dtype f32|f16|bf16`
 - `--quantize off|i8`
 - `--quant-scale FLOAT`
 - `--stream-weights`
@@ -141,6 +143,31 @@ cargo run --release --bin lumen -- \
   --runtime-dtype bf16 \
   --quantize i8 \
   --stream-weights
+```
+
+Example: explicitly split parameter / activation / KV-cache dtypes:
+
+```bash
+cargo run --release --bin lumen -- \
+  --weights path/to/model.safetensors \
+  --tokenizer path/to/tokenizer.json \
+  --parameter-dtype i8 \
+  --activation-dtype bf16 \
+  --kv-cache-dtype bf16
+```
+
+By default, the release CLI keeps startup logs intentionally concise:
+
+- a short model-loading summary
+- a checkpoint loading summary
+- the ready prompt
+
+If you need backend diagnostics while tuning kernels, you can opt in:
+
+```bash
+LUMEN_SHOW_BACKENDS=1 cargo run --release --bin lumen -- \
+  --weights path/to/model.safetensors \
+  --tokenizer path/to/tokenizer.json
 ```
 
 Interactive commands in the example chat loop:
@@ -170,6 +197,8 @@ cargo run --release --bin quantize_safetensors -- \
   --dtype i8 \
   --scale 0.02
 ```
+
+The quantization tool keeps tensor data loading safe and alignment-independent, so it does not rely on unchecked byte reinterpretation.
 
 ---
 

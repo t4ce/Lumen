@@ -117,6 +117,8 @@ cargo run --release --bin lumen -- \
 
 - `--parameter-dtype f32|f16|bf16|i8`
 - `--runtime-dtype f32|f16|bf16`
+- `--activation-dtype f32|f16|bf16`
+- `--kv-cache-dtype f32|f16|bf16`
 - `--quantize off|i8`
 - `--quant-scale FLOAT`
 - `--stream-weights`
@@ -139,6 +141,31 @@ cargo run --release --bin lumen -- \
   --runtime-dtype bf16 \
   --quantize i8 \
   --stream-weights
+```
+
+示例：显式分离参数 / 激活 / KV cache 的 dtype：
+
+```bash
+cargo run --release --bin lumen -- \
+  --weights path/to/model.safetensors \
+  --tokenizer path/to/tokenizer.json \
+  --parameter-dtype i8 \
+  --activation-dtype bf16 \
+  --kv-cache-dtype bf16
+```
+
+当前发布版 CLI 默认会尽量保持启动输出简洁，只保留：
+
+- 一行模型加载摘要
+- 一行权重加载摘要
+- 进入交互前的 ready 提示
+
+如果你在做 kernel 调优、需要看后端诊断信息，可以显式开启：
+
+```bash
+LUMEN_SHOW_BACKENDS=1 cargo run --release --bin lumen -- \
+  --weights path/to/model.safetensors \
+  --tokenizer path/to/tokenizer.json
 ```
 
 示例聊天循环支持的命令：
@@ -168,6 +195,8 @@ cargo run --release --bin quantize_safetensors -- \
   --dtype i8 \
   --scale 0.02
 ```
+
+离线量化工具当前也已经改成安全解码张量字节，不依赖未检查的字节重解释，因此不会受底层对齐问题影响。
 
 ---
 
