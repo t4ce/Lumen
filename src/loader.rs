@@ -80,6 +80,54 @@ struct StreamingHeader {
 
 pub struct ModelLoader;
 
+#[derive(Default)]
+struct LoadReport {
+    loaded: usize,
+    quantized_on_load: usize,
+    missing: Vec<String>,
+}
+
+impl LoadReport {
+    #[inline]
+    fn record_loaded(&mut self, quantized_on_load: bool) {
+        self.loaded += 1;
+        if quantized_on_load {
+            self.quantized_on_load += 1;
+        }
+    }
+
+    #[inline]
+    fn record_missing(&mut self, name: &str) {
+        self.missing.push(name.to_string());
+    }
+
+    fn print_summary(&self) {
+        println!(
+            "Loaded {} tensors{}.",
+            self.loaded,
+            if self.quantized_on_load > 0 {
+                format!(", {} quantized on load", self.quantized_on_load)
+            } else {
+                String::new()
+            }
+        );
+        if !self.missing.is_empty() {
+            let preview = self.missing.iter().take(5).cloned().collect::<Vec<_>>();
+            let suffix = if self.missing.len() > preview.len() {
+                format!(" ... (+{} more)", self.missing.len() - preview.len())
+            } else {
+                String::new()
+            };
+            println!(
+                "Warning: {} parameters were missing from the checkpoint: {}{}",
+                self.missing.len(),
+                preview.join(", "),
+                suffix
+            );
+        }
+    }
+}
+
 impl ModelLoader {
     fn find_i8_scale_tensor_name(tensors: &SafeTensors<'_>, weight_name: &str) -> Option<String> {
         let dot = format!("{weight_name}.scale");
@@ -333,7 +381,7 @@ impl ModelLoader {
         let mut file = File::open(path)?;
         let (data_offset_base, tensor_infos) = Self::read_streaming_header(&mut file)?;
 
-        println!("--- Loading Weights ---");
+        println!("Loading weights...");
 
         let mut ordered = model_params
             .iter()
@@ -347,6 +395,7 @@ impl ModelLoader {
 
         let mut buffer = Vec::new();
         let mut scale_buffer = Vec::new();
+        let mut report = LoadReport::default();
 
         for (_, name, tensor_target, info) in ordered {
             let source_dtype = info.dtype;
@@ -447,25 +496,16 @@ impl ModelLoader {
                     );
                 }
             }
-
-            if direct_quantized_load {
-                println!(
-                    "✅ Loaded: {} (float -> {:?} quantized on load)",
-                    name, target_dtype
-                );
-            } else {
-                println!("✅ Loaded: {}", name);
-            }
+            report.record_loaded(direct_quantized_load);
         }
 
         for name in model_params.keys() {
             if !tensor_infos.contains_key(name) {
-                println!(
-                    "⚠️ Warning: Parameter {} not found in safetensors file",
-                    name
-                );
+                report.record_missing(name);
             }
         }
+
+        report.print_summary();
 
         Ok(())
     }
@@ -485,7 +525,8 @@ impl ModelLoader {
 
         let tensors = SafeTensors::deserialize(&mmap)?;
 
-        println!("--- Loading Weights ---");
+        println!("Loading weights...");
+        let mut report = LoadReport::default();
 
         for (name, tensor_target) in model_params {
             if let Ok(view) = tensors.tensor(name) {
@@ -590,22 +631,13 @@ impl ModelLoader {
                         );
                     }
                 }
-
-                if direct_quantized_load {
-                    println!(
-                        "✅ Loaded: {} (float -> {:?} quantized on load)",
-                        name, target_dtype
-                    );
-                } else {
-                    println!("✅ Loaded: {}", name);
-                }
+                report.record_loaded(direct_quantized_load);
             } else {
-                println!(
-                    "⚠️ Warning: Parameter {} not found in safetensors file",
-                    name
-                );
+                report.record_missing(name);
             }
         }
+
+        report.print_summary();
 
         Ok(())
     }

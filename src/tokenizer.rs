@@ -13,12 +13,16 @@ impl LlamaTokenizer {
         Ok(Self { inner: tokenizer })
     }
 
-    pub fn encode(&self, text: &str, with_special_tokens: bool) -> Vec<usize> {
+    pub fn encode(
+        &self,
+        text: &str,
+        with_special_tokens: bool,
+    ) -> Result<Vec<usize>, Box<dyn Error>> {
         let encoding = self
             .inner
             .encode(text, with_special_tokens)
-            .expect("Tokenization failed");
-        encoding.get_ids().iter().map(|&id| id as usize).collect()
+            .map_err(|e| Box::<dyn Error>::from(e.to_string()))?;
+        Ok(encoding.get_ids().iter().map(|&id| id as usize).collect())
     }
 
     pub fn decode(&self, ids: &[usize], skip_special_tokens: bool) -> String {

@@ -6,7 +6,7 @@ use crate::layers::{Embedding, KVCache, Linear, RMSNorm, SelfAttention, SiLU};
 use crate::module::Module;
 use crate::ops::fused::fused_gate_up_silu_infer_into;
 use crate::ops::matmul::{SliceRef, matvec_argmax_rowmajor_parallel_mixed};
-use crate::precision::{DType, default_runtime_dtype};
+use crate::precision::{DType, default_activation_dtype, default_kv_cache_dtype};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -400,9 +400,14 @@ impl LlamaDecoderLayer {
         }
     }
 
-    fn new_with_dtypes(config: &LlamaConfig, parameter_dtype: DType, runtime_dtype: DType) -> Self {
+    fn new_with_dtypes(
+        config: &LlamaConfig,
+        parameter_dtype: DType,
+        activation_dtype: DType,
+        kv_cache_dtype: DType,
+    ) -> Self {
         Self {
-            self_attn: SelfAttention::new_with_dtypes(
+            self_attn: SelfAttention::new_with_runtime_dtypes(
                 config.hidden_size,
                 config.num_attention_heads,
                 config.num_key_value_heads,
@@ -410,7 +415,8 @@ impl LlamaDecoderLayer {
                 config.rope_theta,
                 true, // causal
                 parameter_dtype,
-                runtime_dtype,
+                activation_dtype,
+                kv_cache_dtype,
             ),
             mlp: LlamaMLP::new_with_dtype(config, parameter_dtype),
             input_layernorm: RMSNorm::new_with_dtype(
@@ -458,17 +464,34 @@ pub struct LlamaModel {
     norm: RMSNorm,
     lm_head: Linear,
     pub config: LlamaConfig,
-    runtime_dtype: DType,
+    activation_dtype: DType,
+    kv_cache_dtype: DType,
 }
 
 impl LlamaModel {
+    #[inline]
+    pub fn activation_dtype(&self) -> DType {
+        self.activation_dtype
+    }
+
+    #[inline]
+    pub fn kv_cache_dtype(&self) -> DType {
+        self.kv_cache_dtype
+    }
+
     pub fn new(config: LlamaConfig) -> Self {
         config.validate();
-        let runtime_dtype = default_runtime_dtype();
+        let activation_dtype = default_activation_dtype();
+        let kv_cache_dtype = default_kv_cache_dtype();
         assert!(
-            runtime_dtype.is_float(),
-            "LlamaModel runtime dtype currently only supports floating types, got {:?}",
-            runtime_dtype
+            activation_dtype.is_float(),
+            "LlamaModel activation dtype currently only supports floating types, got {:?}",
+            activation_dtype
+        );
+        assert!(
+            kv_cache_dtype.is_float(),
+            "LlamaModel KV cache dtype currently only supports floating types, got {:?}",
+            kv_cache_dtype
         );
         let embed_tokens = Embedding::new(config.vocab_size, config.hidden_size);
 
@@ -485,7 +508,8 @@ impl LlamaModel {
             layers,
             norm,
             lm_head,
-            runtime_dtype,
+            activation_dtype,
+            kv_cache_dtype,
             config,
         }
     }
@@ -512,21 +536,28 @@ impl LlamaModel {
             layers,
             norm,
             lm_head,
-            runtime_dtype: dtype,
+            activation_dtype: dtype,
+            kv_cache_dtype: dtype,
             config,
         }
     }
 
-    pub fn new_with_dtypes(
+    pub fn new_with_runtime_dtypes(
         config: LlamaConfig,
         parameter_dtype: DType,
-        runtime_dtype: DType,
+        activation_dtype: DType,
+        kv_cache_dtype: DType,
     ) -> Self {
         config.validate();
         assert!(
-            runtime_dtype.is_float(),
-            "LlamaModel runtime dtype currently only supports floating types, got {:?}",
-            runtime_dtype
+            activation_dtype.is_float(),
+            "LlamaModel activation dtype currently only supports floating types, got {:?}",
+            activation_dtype
+        );
+        assert!(
+            kv_cache_dtype.is_float(),
+            "LlamaModel KV cache dtype currently only supports floating types, got {:?}",
+            kv_cache_dtype
         );
         let embed_tokens =
             Embedding::new_with_dtype(config.vocab_size, config.hidden_size, parameter_dtype);
@@ -536,7 +567,8 @@ impl LlamaModel {
             layers.push(LlamaDecoderLayer::new_with_dtypes(
                 &config,
                 parameter_dtype,
-                runtime_dtype,
+                activation_dtype,
+                kv_cache_dtype,
             ));
         }
 
@@ -551,8 +583,17 @@ impl LlamaModel {
             norm,
             lm_head,
             config,
-            runtime_dtype,
+            activation_dtype,
+            kv_cache_dtype,
         }
+    }
+
+    pub fn new_with_dtypes(
+        config: LlamaConfig,
+        parameter_dtype: DType,
+        runtime_dtype: DType,
+    ) -> Self {
+        Self::new_with_runtime_dtypes(config, parameter_dtype, runtime_dtype, runtime_dtype)
     }
 
     /// 为推理/生成初始化每层 KV cache。
@@ -583,7 +624,7 @@ impl LlamaModel {
                         h_kv,
                         max_seq,
                         head_dim,
-                        self.runtime_dtype,
+                        self.kv_cache_dtype,
                     ),
                 };
                 Rc::new(RefCell::new(cache))
@@ -908,7 +949,10 @@ impl Module for LlamaModel {
 mod tests {
     use super::*;
     use crate::autograd::no_grad;
-    use crate::precision::{PrecisionConfig, set_default_runtime_dtype, with_precision_config};
+    use crate::precision::{
+        PrecisionConfig, set_default_runtime_dtype, with_precision_config,
+        with_runtime_component_dtypes,
+    };
     use ndarray::ArrayD;
     use ndarray::IxDyn;
 
@@ -988,6 +1032,33 @@ mod tests {
                 }
                 let caches = model.init_kv_caches(1);
                 assert_eq!(caches[0].borrow().dtype, DType::BF16);
+            },
+        );
+    }
+
+    #[test]
+    fn llama_model_default_construction_can_override_activation_and_kv_cache_dtypes_independently()
+    {
+        let config = test_config();
+
+        with_precision_config(
+            PrecisionConfig {
+                parameter_dtype: DType::F32,
+                runtime_dtype: DType::F32,
+                allow_parameter_dtype_copies: false,
+            },
+            || {
+                with_runtime_component_dtypes(Some(DType::BF16), Some(DType::F16), || {
+                    let model = LlamaModel::new(config.clone());
+                    assert_eq!(model.activation_dtype(), DType::BF16);
+                    assert_eq!(model.kv_cache_dtype(), DType::F16);
+
+                    let caches = model.init_kv_caches(1);
+                    assert_eq!(caches[0].borrow().dtype, DType::F16);
+                    for param in model.parameters() {
+                        assert_eq!(param.dtype(), DType::F32);
+                    }
+                });
             },
         );
     }

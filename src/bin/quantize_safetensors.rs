@@ -114,6 +114,44 @@ fn bytes_from_f32(data: &[f32]) -> Vec<u8> {
     bytes
 }
 
+fn decode_f32_bytes(data: &[u8], name: &str) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+    if data.len() % 4 != 0 {
+        return Err(format!("{} has invalid F32 byte length {}", name, data.len()).into());
+    }
+    Ok(data
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("f32 chunk should be 4 bytes")))
+        .collect())
+}
+
+fn decode_f16_bytes(data: &[u8], name: &str) -> Result<Vec<f16>, Box<dyn std::error::Error>> {
+    if data.len() % 2 != 0 {
+        return Err(format!("{} has invalid F16 byte length {}", name, data.len()).into());
+    }
+    Ok(data
+        .chunks_exact(2)
+        .map(|chunk| {
+            f16::from_bits(u16::from_le_bytes(
+                chunk.try_into().expect("f16 chunk should be 2 bytes"),
+            ))
+        })
+        .collect())
+}
+
+fn decode_bf16_bytes(data: &[u8], name: &str) -> Result<Vec<bf16>, Box<dyn std::error::Error>> {
+    if data.len() % 2 != 0 {
+        return Err(format!("{} has invalid BF16 byte length {}", name, data.len()).into());
+    }
+    Ok(data
+        .chunks_exact(2)
+        .map(|chunk| {
+            bf16::from_bits(u16::from_le_bytes(
+                chunk.try_into().expect("bf16 chunk should be 2 bytes"),
+            ))
+        })
+        .collect())
+}
+
 fn quantize_f32_slice_to_i8(data: &[f32], scale_override: Option<f32>) -> (Vec<i8>, f32) {
     let scale = if let Some(scale) = scale_override {
         scale
@@ -174,21 +212,9 @@ fn quantize_tensor_view(
     let data = view.data();
     let data = data.as_ref();
     let (quantized, scale) = match view.dtype() {
-        Dtype::F32 => {
-            let slice: &[f32] =
-                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, data.len() / 4) };
-            quantize_f32_slice_to_i8(slice, scale_override)
-        }
-        Dtype::F16 => {
-            let slice: &[f16] =
-                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f16, data.len() / 2) };
-            quantize_f16_slice_to_i8(slice, scale_override)
-        }
-        Dtype::BF16 => {
-            let slice: &[bf16] =
-                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const bf16, data.len() / 2) };
-            quantize_bf16_slice_to_i8(slice, scale_override)
-        }
+        Dtype::F32 => quantize_f32_slice_to_i8(&decode_f32_bytes(data, name)?, scale_override),
+        Dtype::F16 => quantize_f16_slice_to_i8(&decode_f16_bytes(data, name)?, scale_override),
+        Dtype::BF16 => quantize_bf16_slice_to_i8(&decode_bf16_bytes(data, name)?, scale_override),
         other => {
             return Err(format!("{} 不是可量化浮点张量: {:?}", name, other).into());
         }

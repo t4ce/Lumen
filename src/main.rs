@@ -4,9 +4,11 @@ use lumen::autograd::{Tensor, no_grad};
 use lumen::init::{ParameterInitMode, with_parameter_init_mode};
 use lumen::loader::{ModelLoader, WeightLoadOptions};
 use lumen::models::{LlamaConfig, LlamaModel};
+use lumen::ops::fp_kernels::active_float_backend_name;
+use lumen::ops::int8_kernels::active_int8_backend_name;
 use lumen::precision::{
     DType, ParameterQuantization, PrecisionConfig, with_parameter_quantization,
-    with_precision_config,
+    with_precision_config, with_runtime_component_dtypes,
 };
 use lumen::tokenizer::LlamaTokenizer;
 
@@ -33,6 +35,8 @@ struct Args {
     max_gen: usize,
     parameter_dtype: DType,
     runtime_dtype: DType,
+    activation_dtype: DType,
+    kv_cache_dtype: DType,
     allow_parameter_copies: bool,
     parameter_quantization: ParameterQuantization,
     stream_weights: bool,
@@ -42,7 +46,7 @@ struct Args {
 
 fn usage(program: &str) {
     eprintln!(
-        "Usage:\n  {program} --weights PATH --tokenizer PATH [options]\n\nOptions:\n  --system TEXT              System prompt\n  --temperature FLOAT        Sampling temperature (default: 0.8)\n  --top-p FLOAT              Top-p nucleus sampling (default: 0.9)\n  --repetition-penalty FLOAT Repetition penalty (default: 1.05)\n  --recent-window N          Recent token window for repetition penalty (default: 96)\n  --max-gen N                Max generated tokens per turn (default: 200)\n  --parameter-dtype DTYPE    Default parameter dtype: f32/f16/bf16/i8 (default: f32)\n  --runtime-dtype DTYPE      Runtime/KV cache dtype: f32/f16/bf16 (default: f32)\n  --quantize DTYPE           Quantize float weights on load: off/i8 (default: off)\n  --quant-scale FLOAT        Manual quantization scale override\n  --allow-parameter-copies   Allow cached parameter dtype copies\n  --stream-weights           Stream weights from disk instead of memory-mapping whole safetensors\n  --max-seq-len N            Override KV cache max sequence length (default: 2048)\n  --load-only                Load model and initialize KV cache, then exit\n\nCommands in chat:\n  /reset   Clear history and KV cache\n  /exit    Quit"
+        "Usage:\n  {program} --weights PATH --tokenizer PATH [options]\n\nOptions:\n  --system TEXT              System prompt\n  --temperature FLOAT        Sampling temperature (default: 0.8)\n  --top-p FLOAT              Top-p nucleus sampling (default: 0.9)\n  --repetition-penalty FLOAT Repetition penalty (default: 1.05)\n  --recent-window N          Recent token window for repetition penalty (default: 96)\n  --max-gen N                Max generated tokens per turn (default: 200)\n  --parameter-dtype DTYPE    Default parameter dtype: f32/f16/bf16/i8 (default: f32)\n  --runtime-dtype DTYPE      Legacy shared default for activation/KV cache dtype: f32/f16/bf16 (default: f32)\n  --activation-dtype DTYPE   Activation/hidden dtype override: f32/f16/bf16\n  --kv-cache-dtype DTYPE     KV cache dtype override: f32/f16/bf16\n  --quantize DTYPE           Quantize float weights on load: off/i8 (default: off)\n  --quant-scale FLOAT        Manual quantization scale override\n  --allow-parameter-copies   Allow cached parameter dtype copies\n  --stream-weights           Stream weights from disk instead of memory-mapping whole safetensors\n  --max-seq-len N            Override KV cache max sequence length (default: 2048)\n  --load-only                Load model and initialize KV cache, then exit\n\nCommands in chat:\n  /reset   Clear history and KV cache\n  /exit    Quit"
     );
 }
 
@@ -100,6 +104,8 @@ fn parse_args() -> Result<Args, String> {
     let mut max_gen = 200usize;
     let mut parameter_dtype = DType::F32;
     let mut runtime_dtype = DType::F32;
+    let mut activation_dtype: Option<DType> = None;
+    let mut kv_cache_dtype: Option<DType> = None;
     let mut allow_parameter_copies = false;
     let mut quantize_dtype: Option<DType> = None;
     let mut quant_scale: Option<f32> = None;
@@ -181,6 +187,22 @@ fn parse_args() -> Result<Args, String> {
                     argv.get(i).ok_or("--runtime-dtype 缺少 dtype")?,
                     false,
                 )?;
+            }
+            "--activation-dtype" => {
+                i += 1;
+                activation_dtype = Some(parse_dtype_flag(
+                    "--activation-dtype",
+                    argv.get(i).ok_or("--activation-dtype 缺少 dtype")?,
+                    false,
+                )?);
+            }
+            "--kv-cache-dtype" => {
+                i += 1;
+                kv_cache_dtype = Some(parse_dtype_flag(
+                    "--kv-cache-dtype",
+                    argv.get(i).ok_or("--kv-cache-dtype 缺少 dtype")?,
+                    false,
+                )?);
             }
             "--quantize" => {
                 i += 1;
@@ -268,6 +290,8 @@ fn parse_args() -> Result<Args, String> {
         }
         None => ParameterQuantization::Disabled,
     };
+    let activation_dtype = activation_dtype.unwrap_or(runtime_dtype);
+    let kv_cache_dtype = kv_cache_dtype.unwrap_or(runtime_dtype);
 
     Ok(Args {
         weights: weights.ok_or("必须提供 --weights")?,
@@ -280,6 +304,8 @@ fn parse_args() -> Result<Args, String> {
         max_gen,
         parameter_dtype,
         runtime_dtype,
+        activation_dtype,
+        kv_cache_dtype,
         allow_parameter_copies,
         parameter_quantization,
         stream_weights,
@@ -337,7 +363,14 @@ fn sample_top_p(
     repetition_penalty: f32,
     recent_tokens: &[usize],
 ) -> usize {
-    let mut adjusted = logits.to_vec();
+    let mut adjusted = logits
+        .iter()
+        .map(|&v| if v.is_finite() { v } else { f32::NEG_INFINITY })
+        .collect::<Vec<_>>();
+
+    if adjusted.is_empty() {
+        return 0;
+    }
 
     if repetition_penalty > 1.0 {
         for &t in recent_tokens {
@@ -363,22 +396,34 @@ fn sample_top_p(
         *v /= temperature;
     }
 
-    let mut maxv = f32::NEG_INFINITY;
-    for &v in &adjusted {
-        if v > maxv {
-            maxv = v;
+    let mut best_i = 0usize;
+    let mut best_v = f32::NEG_INFINITY;
+    for (i, &v) in adjusted.iter().enumerate() {
+        if v > best_v {
+            best_v = v;
+            best_i = i;
         }
     }
+    if !best_v.is_finite() {
+        return best_i;
+    }
 
-    let mut probs: Vec<f32> = adjusted.iter().map(|x| (x - maxv).exp()).collect();
+    let maxv = best_v;
+    let mut probs: Vec<f32> = adjusted
+        .iter()
+        .map(|&x| if x.is_finite() { (x - maxv).exp() } else { 0.0 })
+        .collect();
     let sum: f32 = probs.iter().sum();
-    let inv = 1.0 / (sum + 1e-9);
+    if !sum.is_finite() || sum <= 0.0 {
+        return best_i;
+    }
+    let inv = 1.0 / sum;
     for p in probs.iter_mut() {
         *p *= inv;
     }
 
     let mut idxs: Vec<usize> = (0..probs.len()).collect();
-    idxs.sort_by(|&i, &j| probs[j].partial_cmp(&probs[i]).unwrap());
+    idxs.sort_by(|&i, &j| probs[j].total_cmp(&probs[i]));
 
     let mut cumulative = 0.0f32;
     let mut cut = 0usize;
@@ -421,6 +466,16 @@ fn last_step_logits_vec(logits: &Tensor) -> Vec<f32> {
     l3.slice(s![0, t, ..]).iter().copied().collect()
 }
 
+fn env_flag_enabled(name: &str) -> bool {
+    match env::var(name) {
+        Ok(value) => matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args().map_err(|e| format!("参数错误: {e}"))?;
     let config = model_config(args.max_seq_len);
@@ -432,16 +487,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("weights 文件不存在: {}", args.weights).into());
     }
 
-    println!("🦀 Loading Rusty Llama...");
+    println!("Loading model...");
     println!(
-        "⚙️  parameter_dtype={:?} runtime_dtype={:?} quantization={:?} allow_parameter_copies={} stream_weights={} max_seq_len={}",
+        "  parameter_dtype={:?} activation_dtype={:?} kv_cache_dtype={:?} quantization={:?} stream_weights={} max_seq_len={}",
         args.parameter_dtype,
-        args.runtime_dtype,
+        args.activation_dtype,
+        args.kv_cache_dtype,
         args.parameter_quantization,
-        args.allow_parameter_copies,
         args.stream_weights,
         args.max_seq_len
     );
+    if env_flag_enabled("LUMEN_SHOW_BACKENDS") {
+        println!(
+            "  runtime_default={:?} fp_backend={} i8_backend={} allow_parameter_copies={}",
+            args.runtime_dtype,
+            active_float_backend_name(),
+            active_int8_backend_name(),
+            args.allow_parameter_copies,
+        );
+    }
     let tokenizer = LlamaTokenizer::from_file(&args.tokenizer)?;
     if tokenizer.vocab_size() != config.vocab_size {
         return Err(format!(
@@ -462,21 +526,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         stream_from_disk: args.stream_weights,
     };
     let model = with_precision_config(precision_config, || {
-        with_parameter_quantization(args.parameter_quantization, || {
-            let model = with_parameter_init_mode(ParameterInitMode::Placeholder, || {
-                LlamaModel::new(config.clone())
-            });
-            println!("📦 Loading weights from: {}", args.weights);
-            ModelLoader::load_llama_weights_with_options(
-                &args.weights,
-                &model.named_parameters(),
-                load_options,
-            )?;
-            Ok::<LlamaModel, Box<dyn std::error::Error>>(model)
-        })
+        with_runtime_component_dtypes(
+            Some(args.activation_dtype),
+            Some(args.kv_cache_dtype),
+            || {
+                with_parameter_quantization(args.parameter_quantization, || {
+                    let model = with_parameter_init_mode(ParameterInitMode::Placeholder, || {
+                        LlamaModel::new(config.clone())
+                    });
+                    println!("  weights={}", args.weights);
+                    ModelLoader::load_llama_weights_with_options(
+                        &args.weights,
+                        &model.named_parameters(),
+                        load_options,
+                    )?;
+                    Ok::<LlamaModel, Box<dyn std::error::Error>>(model)
+                })
+            },
+        )
     })?;
 
-    println!("\n✨ System Ready. Commands: /reset  /exit");
+    println!("\nReady. Commands: /reset  /exit");
 
     let mut stop_ids: Vec<usize> = Vec::new();
     for t in ["</s>", "<|system|>", "<|user|>", "<|assistant|>"] {
@@ -500,7 +570,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     model.reset_kv_caches(&mut kv_caches);
 
     if args.load_only {
-        println!("✅ load-only complete.");
+        println!("load-only complete.");
         return Ok(());
     }
 
@@ -522,7 +592,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             all_tokens.clear();
             model.reset_kv_caches(&mut kv_caches);
             first_turn = true;
-            println!("🔄 reset done.");
+            println!("reset done.");
             continue;
         }
 
@@ -536,7 +606,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 build_next_turn_prompt(user_msg)
             };
 
-            let mut new_tokens = tokenizer.encode(&turn_prompt, false);
+            let mut new_tokens = match tokenizer.encode(&turn_prompt, false) {
+                Ok(tokens) => tokens,
+                Err(err) => {
+                    eprintln!("tokenization failed: {err}");
+                    println!();
+                    return;
+                }
+            };
 
             if new_tokens.is_empty() {
                 println!();
@@ -550,7 +627,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 model.reset_kv_caches(&mut kv_caches);
 
                 let prompt2 = build_first_turn_prompt(&args.system, user_msg);
-                new_tokens = tokenizer.encode(&prompt2, false);
+                new_tokens = match tokenizer.encode(&prompt2, false) {
+                    Ok(tokens) => tokens,
+                    Err(err) => {
+                        eprintln!("tokenization failed: {err}");
+                        println!();
+                        return;
+                    }
+                };
                 if new_tokens.is_empty() {
                     println!();
                     first_turn = false;

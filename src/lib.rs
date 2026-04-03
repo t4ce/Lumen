@@ -1,5 +1,6 @@
 // src/lib.rs
 
+pub mod arch;
 pub mod autograd;
 pub mod precision;
 #[macro_use]

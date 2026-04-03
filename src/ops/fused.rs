@@ -5,8 +5,9 @@ use crate::ops::matmul::{
     SliceRef, dual_matvec_rowmajor_parallel_mixed, dual_matvec_silu_mul_rowmajor_parallel_f32_bf16,
     dual_matvec_silu_mul_rowmajor_parallel_f32_f16, dual_matvec_silu_mul_rowmajor_parallel_f32_i8,
     dual_matvec_silu_mul_rowmajor_parallel_mixed, matvec_rowmajor_parallel_mixed,
-    qkv_matvec_rowmajor_parallel_f32_bf16, qkv_matvec_rowmajor_parallel_f32_f16,
-    qkv_matvec_rowmajor_parallel_f32_i8, with_bf16_input_as_f32, with_f16_input_as_f32,
+    qkv_matvec_rowmajor_parallel, qkv_matvec_rowmajor_parallel_f32_bf16,
+    qkv_matvec_rowmajor_parallel_f32_f16, qkv_matvec_rowmajor_parallel_f32_i8,
+    with_bf16_input_as_f32, with_f16_input_as_f32,
 };
 use crate::precision::DType;
 use half::{bf16, f16};
@@ -307,6 +308,16 @@ fn run_qkv_slices(
     match (x_slice, q_slice, k_slice, v_slice) {
         (
             SliceRef::F32(x_f32),
+            SliceRef::F32(q_slice),
+            SliceRef::F32(k_slice),
+            SliceRef::F32(v_slice),
+        ) => {
+            qkv_matvec_rowmajor_parallel(
+                x_f32, q_slice, k_slice, v_slice, q_n, k_n, k_dim, q_out, k_out, v_out,
+            );
+        }
+        (
+            SliceRef::F32(x_f32),
             SliceRef::F16(q_slice),
             SliceRef::F16(k_slice),
             SliceRef::F16(v_slice),
@@ -317,12 +328,36 @@ fn run_qkv_slices(
         }
         (
             SliceRef::F16(x_f16),
+            SliceRef::F32(q_slice),
+            SliceRef::F32(k_slice),
+            SliceRef::F32(v_slice),
+        ) => {
+            with_f16_input_as_f32(x_f16, |x_f32| {
+                qkv_matvec_rowmajor_parallel(
+                    x_f32, q_slice, k_slice, v_slice, q_n, k_n, k_dim, q_out, k_out, v_out,
+                );
+            });
+        }
+        (
+            SliceRef::F16(x_f16),
             SliceRef::F16(q_slice),
             SliceRef::F16(k_slice),
             SliceRef::F16(v_slice),
         ) => {
             with_f16_input_as_f32(x_f16, |x_f32| {
                 qkv_matvec_rowmajor_parallel_f32_f16(
+                    x_f32, q_slice, k_slice, v_slice, q_n, k_n, k_dim, q_out, k_out, v_out,
+                );
+            });
+        }
+        (
+            SliceRef::BF16(x_bf16),
+            SliceRef::F32(q_slice),
+            SliceRef::F32(k_slice),
+            SliceRef::F32(v_slice),
+        ) => {
+            with_bf16_input_as_f32(x_bf16, |x_f32| {
+                qkv_matvec_rowmajor_parallel(
                     x_f32, q_slice, k_slice, v_slice, q_n, k_n, k_dim, q_out, k_out, v_out,
                 );
             });

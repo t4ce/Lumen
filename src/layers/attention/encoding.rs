@@ -1,5 +1,5 @@
 use crate::autograd::{StoragePreference, Tensor, TensorData, TensorStorageView, is_no_grad};
-use crate::precision::{DType, default_runtime_dtype};
+use crate::precision::{DType, default_activation_dtype};
 use half::{bf16, f16};
 use ndarray::{Array, ArrayD, Ix2, Zip, s};
 use std::cell::RefCell;
@@ -16,7 +16,7 @@ pub struct RotaryEmbedding {
 
 impl RotaryEmbedding {
     pub fn new(dim: usize, max_seq_len: usize, theta: f32) -> Self {
-        Self::new_with_dtype(dim, max_seq_len, theta, default_runtime_dtype())
+        Self::new_with_dtype(dim, max_seq_len, theta, default_activation_dtype())
     }
 
     pub fn new_with_dtype(dim: usize, max_seq_len: usize, theta: f32, dtype: DType) -> Self {

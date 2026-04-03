@@ -2,6 +2,11 @@ use crate::autograd::{
     KernelRouteClass, StoragePreference, Tensor, TensorData, TensorStorageOwned, TensorStorageView,
     is_no_grad,
 };
+use crate::ops::fp_kernels::{
+    dot_f32_arch, dot_f32_bf16_arch, dot_f32_f16_arch, dot2_f32_arch, dot2_f32_bf16_arch,
+    dot2_f32_f16_arch, dot3_f32_arch, dot3_f32_bf16_arch, dot3_f32_f16_arch,
+};
+use crate::ops::int8_kernels::{dot_f32_i8_arch, dot2_f32_i8_arch, dot3_f32_i8_arch};
 use crate::precision::DType;
 use half::{bf16, f16, slice::HalfFloatSliceExt};
 use ndarray::linalg::general_mat_mul;
@@ -10,15 +15,88 @@ use rayon::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+#[cfg(all(feature = "arm64-int8-kernels", target_arch = "aarch64"))]
+const MATVEC_BLOCK_ROWS: usize = 32;
+#[cfg(not(all(feature = "arm64-int8-kernels", target_arch = "aarch64")))]
 const MATVEC_BLOCK_ROWS: usize = 16;
+
+#[cfg(all(feature = "arm64-int8-kernels", target_arch = "aarch64"))]
+const SILU_I8_BLOCK_ROWS: usize = 64;
+#[cfg(not(all(feature = "arm64-int8-kernels", target_arch = "aarch64")))]
 const SILU_I8_BLOCK_ROWS: usize = 32;
+
 const ARGMAX_BLOCK_ROWS: usize = 32;
+
+#[cfg(all(feature = "arm64-int8-kernels", target_arch = "aarch64"))]
+const MATVEC_I8_PAR_CHUNK_ROWS: usize = 128;
+#[cfg(not(all(feature = "arm64-int8-kernels", target_arch = "aarch64")))]
 const MATVEC_I8_PAR_CHUNK_ROWS: usize = 32;
+
+#[cfg(all(feature = "arm64-int8-kernels", target_arch = "aarch64"))]
+const QKV_I8_PAR_CHUNK_ROWS: usize = 64;
+#[cfg(not(all(feature = "arm64-int8-kernels", target_arch = "aarch64")))]
 const QKV_I8_PAR_CHUNK_ROWS: usize = 16;
+
 const MATVEC_BLOCK_THRESHOLD: usize = 16384;
-const MATVEC_I8_BLOCK_THRESHOLD: usize = 4096;
+#[cfg(all(feature = "arm64-int8-kernels", target_arch = "aarch64"))]
+const MATVEC_PAR_THRESHOLD: usize = 1024;
+#[cfg(not(all(feature = "arm64-int8-kernels", target_arch = "aarch64")))]
 const MATVEC_PAR_THRESHOLD: usize = 256;
-const MIXED_SILU_BLOCK_THRESHOLD: usize = 2048;
+
+#[inline]
+fn should_use_mixed_silu_block_kernel(n_rows: usize) -> bool {
+    #[cfg(all(feature = "arm64-fp-kernels", target_arch = "aarch64"))]
+    {
+        let _ = n_rows;
+        false
+    }
+
+    #[cfg(not(all(feature = "arm64-fp-kernels", target_arch = "aarch64")))]
+    {
+        n_rows >= 2048
+    }
+}
+
+#[inline]
+fn should_use_mixed_matvec_block_kernel(n_rows: usize) -> bool {
+    #[cfg(all(feature = "arm64-fp-kernels", target_arch = "aarch64"))]
+    {
+        let _ = n_rows;
+        false
+    }
+
+    #[cfg(not(all(feature = "arm64-fp-kernels", target_arch = "aarch64")))]
+    {
+        n_rows >= MATVEC_BLOCK_THRESHOLD
+    }
+}
+
+fn should_use_mixed_dual_block_kernel(n_rows: usize) -> bool {
+    #[cfg(all(feature = "arm64-fp-kernels", target_arch = "aarch64"))]
+    {
+        let _ = n_rows;
+        false
+    }
+
+    #[cfg(not(all(feature = "arm64-fp-kernels", target_arch = "aarch64")))]
+    {
+        n_rows >= MATVEC_BLOCK_THRESHOLD
+    }
+}
+
+#[inline]
+fn should_use_argmax_block_kernel(n_rows: usize) -> bool {
+    #[cfg(all(feature = "arm64-fp-kernels", target_arch = "aarch64"))]
+    {
+        let _ = n_rows;
+        false
+    }
+
+    #[cfg(not(all(feature = "arm64-fp-kernels", target_arch = "aarch64")))]
+    {
+        n_rows >= MATVEC_BLOCK_THRESHOLD
+    }
+}
 
 thread_local! {
     static F16_TO_F32_SCRATCH: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
@@ -67,7 +145,43 @@ fn should_use_i8_block_kernel(n_rows: usize, k_dim: usize) -> bool {
 
 #[inline]
 fn should_use_i8_silu_block_kernel(n_rows: usize, k_dim: usize) -> bool {
-    n_rows >= MATVEC_I8_BLOCK_THRESHOLD && k_dim >= 1024
+    #[cfg(all(feature = "arm64-int8-kernels", target_arch = "aarch64"))]
+    {
+        let _ = (n_rows, k_dim);
+        false
+    }
+
+    #[cfg(not(all(feature = "arm64-int8-kernels", target_arch = "aarch64")))]
+    {
+        n_rows >= 4096 && k_dim >= 1024
+    }
+}
+
+#[inline]
+fn should_use_i8_matmul_block_kernel(n_rows: usize, k_dim: usize) -> bool {
+    #[cfg(all(feature = "arm64-int8-kernels", target_arch = "aarch64"))]
+    {
+        let _ = (n_rows, k_dim);
+        false
+    }
+
+    #[cfg(not(all(feature = "arm64-int8-kernels", target_arch = "aarch64")))]
+    {
+        n_rows >= 4096 && k_dim >= 1024
+    }
+}
+
+#[inline]
+fn should_use_i8_qkv_row4_kernel() -> bool {
+    #[cfg(all(feature = "arm64-int8-kernels", target_arch = "aarch64"))]
+    {
+        false
+    }
+
+    #[cfg(not(all(feature = "arm64-int8-kernels", target_arch = "aarch64")))]
+    {
+        true
+    }
 }
 
 #[inline]
@@ -127,6 +241,10 @@ pub(crate) fn with_i8_input_as_f32<R>(x: &[i8], scale: f32, f: impl FnOnce(&[f32
 
 #[inline]
 pub(crate) fn dot_unrolled(x: &[f32], row: &[f32]) -> f32 {
+    if let Some(sum) = dot_f32_arch(x, row) {
+        return sum;
+    }
+
     let mut s0 = 0.0f32;
     let mut s1 = 0.0f32;
     let mut s2 = 0.0f32;
@@ -160,6 +278,10 @@ pub(crate) fn dot_unrolled(x: &[f32], row: &[f32]) -> f32 {
 
 #[inline]
 pub(crate) fn dot_unrolled_f32_bf16(x: &[f32], row: &[bf16]) -> f32 {
+    if let Some(sum) = dot_f32_bf16_arch(x, row) {
+        return sum;
+    }
+
     let mut s0 = 0.0f32;
     let mut s1 = 0.0f32;
     let mut s2 = 0.0f32;
@@ -193,6 +315,10 @@ pub(crate) fn dot_unrolled_f32_bf16(x: &[f32], row: &[bf16]) -> f32 {
 
 #[inline]
 pub(crate) fn dot_unrolled_f32_f16(x: &[f32], row: &[f16]) -> f32 {
+    if let Some(sum) = dot_f32_f16_arch(x, row) {
+        return sum;
+    }
+
     let mut s0 = 0.0f32;
     let mut s1 = 0.0f32;
     let mut s2 = 0.0f32;
@@ -225,7 +351,7 @@ pub(crate) fn dot_unrolled_f32_f16(x: &[f32], row: &[f16]) -> f32 {
 }
 
 #[inline]
-pub(crate) fn dot_unrolled_f32_i8(x: &[f32], row: &[i8], scale: f32) -> f32 {
+fn dot_unrolled_f32_i8_portable(x: &[f32], row: &[i8], scale: f32) -> f32 {
     let mut s0 = 0.0f32;
     let mut s1 = 0.0f32;
     let mut s2 = 0.0f32;
@@ -271,6 +397,15 @@ pub(crate) fn dot_unrolled_f32_i8(x: &[f32], row: &[i8], scale: f32) -> f32 {
         kk += 1;
     }
     sum * scale
+}
+
+#[inline]
+pub(crate) fn dot_unrolled_f32_i8(x: &[f32], row: &[i8], scale: f32) -> f32 {
+    if let Some(sum) = dot_f32_i8_arch(x, row, scale) {
+        sum
+    } else {
+        dot_unrolled_f32_i8_portable(x, row, scale)
+    }
 }
 
 #[inline]
@@ -623,7 +758,7 @@ pub fn matvec_rowmajor_parallel_f32_bf16(
 
     if n_rows < MATVEC_PAR_THRESHOLD {
         matvec_rowmajor_serial_f32_bf16(x, w_rowmajor, n_rows, k_dim, out);
-    } else if n_rows >= MATVEC_BLOCK_THRESHOLD {
+    } else if should_use_mixed_matvec_block_kernel(n_rows) {
         matvec_rowmajor_block_parallel_f32_bf16(x, w_rowmajor, n_rows, k_dim, out);
     } else {
         matvec_rowmajor_rowwise_parallel_f32_bf16(x, w_rowmajor, n_rows, k_dim, out);
@@ -686,7 +821,7 @@ pub fn matvec_rowmajor_parallel_f32_i8_matmul(
 
     if n_rows < MATVEC_PAR_THRESHOLD {
         matvec_rowmajor_serial_f32_i8(x, w_rowmajor, scale, n_rows, k_dim, out);
-    } else if n_rows >= MATVEC_I8_BLOCK_THRESHOLD && k_dim >= 1024 {
+    } else if should_use_i8_matmul_block_kernel(n_rows, k_dim) {
         matvec_rowmajor_block_parallel_f32_i8(x, w_rowmajor, scale, n_rows, k_dim, out);
     } else {
         matvec_rowmajor_rowwise_parallel_f32_i8(x, w_rowmajor, scale, n_rows, k_dim, out);
@@ -850,6 +985,10 @@ pub fn matvec_rowmajor_parallel_mixed(
 
 #[inline]
 pub(crate) fn dot2_unrolled(x: &[f32], row0: &[f32], row1: &[f32]) -> (f32, f32) {
+    if let Some(sum) = dot2_f32_arch(x, row0, row1) {
+        return sum;
+    }
+
     let mut a0 = 0.0f32;
     let mut a1 = 0.0f32;
     let mut b0 = 0.0f32;
@@ -911,6 +1050,10 @@ pub(crate) fn dot2_unrolled(x: &[f32], row0: &[f32], row1: &[f32]) -> (f32, f32)
 
 #[inline]
 pub(crate) fn dot2_unrolled_f32_bf16(x: &[f32], row0: &[bf16], row1: &[bf16]) -> (f32, f32) {
+    if let Some(sum) = dot2_f32_bf16_arch(x, row0, row1) {
+        return sum;
+    }
+
     let mut a0 = 0.0f32;
     let mut a1 = 0.0f32;
     let mut b0 = 0.0f32;
@@ -972,6 +1115,10 @@ pub(crate) fn dot2_unrolled_f32_bf16(x: &[f32], row0: &[bf16], row1: &[bf16]) ->
 
 #[inline]
 pub(crate) fn dot2_unrolled_f32_f16(x: &[f32], row0: &[f16], row1: &[f16]) -> (f32, f32) {
+    if let Some(sum) = dot2_f32_f16_arch(x, row0, row1) {
+        return sum;
+    }
+
     let mut a0 = 0.0f32;
     let mut a1 = 0.0f32;
     let mut b0 = 0.0f32;
@@ -1039,6 +1186,10 @@ pub(crate) fn dot2_unrolled_f32_i8(
     row1: &[i8],
     scale1: f32,
 ) -> (f32, f32) {
+    if let Some(sum) = dot2_f32_i8_arch(x, row0, scale0, row1, scale1) {
+        return sum;
+    }
+
     let mut a0 = 0.0f32;
     let mut a1 = 0.0f32;
     let mut b0 = 0.0f32;
@@ -1160,12 +1311,181 @@ pub(crate) fn dot2_unrolled_f32_i8(
 }
 
 #[inline]
+pub(crate) fn dot3_unrolled(
+    x: &[f32],
+    row0: &[f32],
+    row1: &[f32],
+    row2: &[f32],
+) -> (f32, f32, f32) {
+    if let Some(sum) = dot3_f32_arch(x, row0, row1, row2) {
+        return sum;
+    }
+
+    let mut a0 = 0.0f32;
+    let mut a1 = 0.0f32;
+    let mut a2 = 0.0f32;
+    let mut b0 = 0.0f32;
+    let mut b1 = 0.0f32;
+    let mut b2 = 0.0f32;
+    let mut c0 = 0.0f32;
+    let mut c1 = 0.0f32;
+    let mut c2 = 0.0f32;
+    let mut d0 = 0.0f32;
+    let mut d1 = 0.0f32;
+    let mut d2 = 0.0f32;
+    let mut e0 = 0.0f32;
+    let mut e1 = 0.0f32;
+    let mut e2 = 0.0f32;
+    let mut f0 = 0.0f32;
+    let mut f1 = 0.0f32;
+    let mut f2 = 0.0f32;
+    let mut g0 = 0.0f32;
+    let mut g1 = 0.0f32;
+    let mut g2 = 0.0f32;
+    let mut h0 = 0.0f32;
+    let mut h1 = 0.0f32;
+    let mut h2 = 0.0f32;
+    let mut kk = 0usize;
+    let k_dim = x.len();
+
+    while kk + 16 <= k_dim {
+        let x0 = x[kk];
+        let x1 = x[kk + 1];
+        let x2 = x[kk + 2];
+        let x3 = x[kk + 3];
+        let x4 = x[kk + 4];
+        let x5 = x[kk + 5];
+        let x6 = x[kk + 6];
+        let x7 = x[kk + 7];
+        let x8 = x[kk + 8];
+        let x9 = x[kk + 9];
+        let x10 = x[kk + 10];
+        let x11 = x[kk + 11];
+        let x12 = x[kk + 12];
+        let x13 = x[kk + 13];
+        let x14 = x[kk + 14];
+        let x15 = x[kk + 15];
+
+        a0 += row0[kk] * x0;
+        a1 += row1[kk] * x0;
+        a2 += row2[kk] * x0;
+        b0 += row0[kk + 1] * x1;
+        b1 += row1[kk + 1] * x1;
+        b2 += row2[kk + 1] * x1;
+        c0 += row0[kk + 2] * x2;
+        c1 += row1[kk + 2] * x2;
+        c2 += row2[kk + 2] * x2;
+        d0 += row0[kk + 3] * x3;
+        d1 += row1[kk + 3] * x3;
+        d2 += row2[kk + 3] * x3;
+        e0 += row0[kk + 4] * x4;
+        e1 += row1[kk + 4] * x4;
+        e2 += row2[kk + 4] * x4;
+        f0 += row0[kk + 5] * x5;
+        f1 += row1[kk + 5] * x5;
+        f2 += row2[kk + 5] * x5;
+        g0 += row0[kk + 6] * x6;
+        g1 += row1[kk + 6] * x6;
+        g2 += row2[kk + 6] * x6;
+        h0 += row0[kk + 7] * x7;
+        h1 += row1[kk + 7] * x7;
+        h2 += row2[kk + 7] * x7;
+        a0 += row0[kk + 8] * x8;
+        a1 += row1[kk + 8] * x8;
+        a2 += row2[kk + 8] * x8;
+        b0 += row0[kk + 9] * x9;
+        b1 += row1[kk + 9] * x9;
+        b2 += row2[kk + 9] * x9;
+        c0 += row0[kk + 10] * x10;
+        c1 += row1[kk + 10] * x10;
+        c2 += row2[kk + 10] * x10;
+        d0 += row0[kk + 11] * x11;
+        d1 += row1[kk + 11] * x11;
+        d2 += row2[kk + 11] * x11;
+        e0 += row0[kk + 12] * x12;
+        e1 += row1[kk + 12] * x12;
+        e2 += row2[kk + 12] * x12;
+        f0 += row0[kk + 13] * x13;
+        f1 += row1[kk + 13] * x13;
+        f2 += row2[kk + 13] * x13;
+        g0 += row0[kk + 14] * x14;
+        g1 += row1[kk + 14] * x14;
+        g2 += row2[kk + 14] * x14;
+        h0 += row0[kk + 15] * x15;
+        h1 += row1[kk + 15] * x15;
+        h2 += row2[kk + 15] * x15;
+        kk += 16;
+    }
+
+    while kk + 8 <= k_dim {
+        let x0 = x[kk];
+        let x1 = x[kk + 1];
+        let x2 = x[kk + 2];
+        let x3 = x[kk + 3];
+        let x4 = x[kk + 4];
+        let x5 = x[kk + 5];
+        let x6 = x[kk + 6];
+        let x7 = x[kk + 7];
+
+        a0 += row0[kk] * x0 + row0[kk + 4] * x4;
+        a1 += row1[kk] * x0 + row1[kk + 4] * x4;
+        a2 += row2[kk] * x0 + row2[kk + 4] * x4;
+        b0 += row0[kk + 1] * x1 + row0[kk + 5] * x5;
+        b1 += row1[kk + 1] * x1 + row1[kk + 5] * x5;
+        b2 += row2[kk + 1] * x1 + row2[kk + 5] * x5;
+        c0 += row0[kk + 2] * x2 + row0[kk + 6] * x6;
+        c1 += row1[kk + 2] * x2 + row1[kk + 6] * x6;
+        c2 += row2[kk + 2] * x2 + row2[kk + 6] * x6;
+        d0 += row0[kk + 3] * x3 + row0[kk + 7] * x7;
+        d1 += row1[kk + 3] * x3 + row1[kk + 7] * x7;
+        d2 += row2[kk + 3] * x3 + row2[kk + 7] * x7;
+        kk += 8;
+    }
+
+    while kk + 4 <= k_dim {
+        let x0 = x[kk];
+        let x1 = x[kk + 1];
+        let x2 = x[kk + 2];
+        let x3 = x[kk + 3];
+        a0 += row0[kk] * x0;
+        a1 += row1[kk] * x0;
+        a2 += row2[kk] * x0;
+        b0 += row0[kk + 1] * x1;
+        b1 += row1[kk + 1] * x1;
+        b2 += row2[kk + 1] * x1;
+        c0 += row0[kk + 2] * x2;
+        c1 += row1[kk + 2] * x2;
+        c2 += row2[kk + 2] * x2;
+        d0 += row0[kk + 3] * x3;
+        d1 += row1[kk + 3] * x3;
+        d2 += row2[kk + 3] * x3;
+        kk += 4;
+    }
+
+    let mut sum0 = a0 + b0 + c0 + d0 + e0 + f0 + g0 + h0;
+    let mut sum1 = a1 + b1 + c1 + d1 + e1 + f1 + g1 + h1;
+    let mut sum2 = a2 + b2 + c2 + d2 + e2 + f2 + g2 + h2;
+    while kk < k_dim {
+        let xv = x[kk];
+        sum0 += row0[kk] * xv;
+        sum1 += row1[kk] * xv;
+        sum2 += row2[kk] * xv;
+        kk += 1;
+    }
+    (sum0, sum1, sum2)
+}
+
+#[inline]
 pub(crate) fn dot3_unrolled_f32_bf16(
     x: &[f32],
     row0: &[bf16],
     row1: &[bf16],
     row2: &[bf16],
 ) -> (f32, f32, f32) {
+    if let Some(sum) = dot3_f32_bf16_arch(x, row0, row1, row2) {
+        return sum;
+    }
+
     let mut a0 = 0.0f32;
     let mut a1 = 0.0f32;
     let mut a2 = 0.0f32;
@@ -1327,6 +1647,10 @@ pub(crate) fn dot3_unrolled_f32_f16(
     row1: &[f16],
     row2: &[f16],
 ) -> (f32, f32, f32) {
+    if let Some(sum) = dot3_f32_f16_arch(x, row0, row1, row2) {
+        return sum;
+    }
+
     let mut a0 = 0.0f32;
     let mut a1 = 0.0f32;
     let mut a2 = 0.0f32;
@@ -1401,7 +1725,7 @@ pub(crate) fn dot3_unrolled_f32_f16(
 }
 
 #[inline]
-pub(crate) fn dot3_unrolled_f32_i8(
+fn dot3_unrolled_f32_i8_portable(
     x: &[f32],
     row0: &[i8],
     scale0: f32,
@@ -1562,6 +1886,23 @@ pub(crate) fn dot3_unrolled_f32_i8(
         kk += 1;
     }
     (sum0 * scale0, sum1 * scale1, sum2 * scale2)
+}
+
+#[inline]
+pub(crate) fn dot3_unrolled_f32_i8(
+    x: &[f32],
+    row0: &[i8],
+    scale0: f32,
+    row1: &[i8],
+    scale1: f32,
+    row2: &[i8],
+    scale2: f32,
+) -> (f32, f32, f32) {
+    if let Some(sum) = dot3_f32_i8_arch(x, row0, scale0, row1, scale1, row2, scale2) {
+        sum
+    } else {
+        dot3_unrolled_f32_i8_portable(x, row0, scale0, row1, scale1, row2, scale2)
+    }
 }
 
 #[inline]
@@ -1801,7 +2142,7 @@ pub(crate) fn dual_matvec_rowmajor_parallel_f32_bf16(
             out0[i] = s0;
             out1[i] = s1;
         }
-    } else if n_rows >= MATVEC_BLOCK_THRESHOLD {
+    } else if should_use_mixed_dual_block_kernel(n_rows) {
         dual_matvec_rowmajor_block_parallel_f32_bf16(
             x,
             w0_rowmajor,
@@ -2319,6 +2660,77 @@ pub fn dual_matvec_rowmajor_parallel_mixed(
 }
 
 #[inline]
+pub(crate) fn qkv_matvec_rowmajor_parallel(
+    x: &[f32],
+    q_rowmajor: &[f32],
+    k_rowmajor: &[f32],
+    v_rowmajor: &[f32],
+    q_rows: usize,
+    kv_rows: usize,
+    k_dim: usize,
+    q_out: &mut [f32],
+    k_out: &mut [f32],
+    v_out: &mut [f32],
+) {
+    assert_eq!(x.len(), k_dim, "x len / k_dim mismatch");
+    assert_eq!(q_rowmajor.len(), q_rows * k_dim, "Q weight size mismatch");
+    assert_eq!(k_rowmajor.len(), kv_rows * k_dim, "K weight size mismatch");
+    assert_eq!(v_rowmajor.len(), kv_rows * k_dim, "V weight size mismatch");
+    assert_eq!(q_out.len(), q_rows, "Q output size mismatch");
+    assert_eq!(k_out.len(), kv_rows, "K output size mismatch");
+    assert_eq!(v_out.len(), kv_rows, "V output size mismatch");
+
+    let shared_rows = q_rows.min(kv_rows);
+    if shared_rows < MATVEC_PAR_THRESHOLD {
+        for i in 0..shared_rows {
+            let q_row = &q_rowmajor[i * k_dim..(i + 1) * k_dim];
+            let k_row = &k_rowmajor[i * k_dim..(i + 1) * k_dim];
+            let v_row = &v_rowmajor[i * k_dim..(i + 1) * k_dim];
+            let (q, k, v) = dot3_unrolled(x, q_row, k_row, v_row);
+            q_out[i] = q;
+            k_out[i] = k;
+            v_out[i] = v;
+        }
+    } else {
+        q_out[..shared_rows]
+            .par_iter_mut()
+            .zip(k_out[..shared_rows].par_iter_mut())
+            .zip(v_out[..shared_rows].par_iter_mut())
+            .enumerate()
+            .for_each(|(i, ((q_dst, k_dst), v_dst))| {
+                let q_row = &q_rowmajor[i * k_dim..(i + 1) * k_dim];
+                let k_row = &k_rowmajor[i * k_dim..(i + 1) * k_dim];
+                let v_row = &v_rowmajor[i * k_dim..(i + 1) * k_dim];
+                let (q, k, v) = dot3_unrolled(x, q_row, k_row, v_row);
+                *q_dst = q;
+                *k_dst = k;
+                *v_dst = v;
+            });
+    }
+
+    if q_rows > shared_rows {
+        matvec_rowmajor_parallel(
+            x,
+            &q_rowmajor[shared_rows * k_dim..],
+            q_rows - shared_rows,
+            k_dim,
+            &mut q_out[shared_rows..],
+        );
+    }
+    if kv_rows > shared_rows {
+        dual_matvec_rowmajor_parallel(
+            x,
+            &k_rowmajor[shared_rows * k_dim..],
+            &v_rowmajor[shared_rows * k_dim..],
+            kv_rows - shared_rows,
+            k_dim,
+            &mut k_out[shared_rows..],
+            &mut v_out[shared_rows..],
+        );
+    }
+}
+
+#[inline]
 pub(crate) fn qkv_matvec_rowmajor_parallel_f32_bf16(
     x: &[f32],
     q_rowmajor: &[bf16],
@@ -2519,23 +2931,25 @@ pub(crate) fn qkv_matvec_rowmajor_parallel_f32_i8(
             .for_each(|(chunk_idx, ((q_chunk, k_chunk), v_chunk))| {
                 let row_start = chunk_idx * QKV_I8_PAR_CHUNK_ROWS;
                 let mut offset = 0usize;
-                while offset + 4 <= q_chunk.len() {
-                    let row_idx = row_start + offset;
-                    dot3_rows_unrolled_f32_i8(
-                        x,
-                        &q_rowmajor[row_idx * k_dim..(row_idx + 4) * k_dim],
-                        q_scale,
-                        &k_rowmajor[row_idx * k_dim..(row_idx + 4) * k_dim],
-                        k_scale,
-                        &v_rowmajor[row_idx * k_dim..(row_idx + 4) * k_dim],
-                        v_scale,
-                        k_dim,
-                        4,
-                        &mut q_chunk[offset..offset + 4],
-                        &mut k_chunk[offset..offset + 4],
-                        &mut v_chunk[offset..offset + 4],
-                    );
-                    offset += 4;
+                if should_use_i8_qkv_row4_kernel() {
+                    while offset + 4 <= q_chunk.len() {
+                        let row_idx = row_start + offset;
+                        dot3_rows_unrolled_f32_i8(
+                            x,
+                            &q_rowmajor[row_idx * k_dim..(row_idx + 4) * k_dim],
+                            q_scale,
+                            &k_rowmajor[row_idx * k_dim..(row_idx + 4) * k_dim],
+                            k_scale,
+                            &v_rowmajor[row_idx * k_dim..(row_idx + 4) * k_dim],
+                            v_scale,
+                            k_dim,
+                            4,
+                            &mut q_chunk[offset..offset + 4],
+                            &mut k_chunk[offset..offset + 4],
+                            &mut v_chunk[offset..offset + 4],
+                        );
+                        offset += 4;
+                    }
                 }
                 while offset < q_chunk.len() {
                     let row_idx = row_start + offset;
@@ -2807,7 +3221,7 @@ pub(crate) fn dual_matvec_silu_mul_rowmajor_parallel_f32_bf16(
             let sig = 1.0 / (1.0 + (-g).exp());
             out[i] = (g * sig) * u;
         }
-    } else if n_rows >= MIXED_SILU_BLOCK_THRESHOLD {
+    } else if should_use_mixed_silu_block_kernel(n_rows) {
         dual_matvec_silu_mul_rowmajor_block_parallel_f32_bf16(
             x,
             gate_w_rowmajor,
@@ -3394,7 +3808,7 @@ pub fn matvec_argmax_rowmajor_parallel(
     assert_eq!(x.len(), k_dim, "x len / k_dim mismatch");
     assert_eq!(w_rowmajor.len(), n_rows * k_dim, "weight size mismatch");
 
-    if n_rows >= MATVEC_BLOCK_THRESHOLD {
+    if should_use_argmax_block_kernel(n_rows) {
         let n_blocks = (n_rows + ARGMAX_BLOCK_ROWS - 1) / ARGMAX_BLOCK_ROWS;
         return (0..n_blocks)
             .into_par_iter()
@@ -3522,7 +3936,7 @@ fn matvec_argmax_rowmajor_parallel_f32_f16(
     assert_eq!(x.len(), k_dim, "x len / k_dim mismatch");
     assert_eq!(w_rowmajor.len(), n_rows * k_dim, "weight size mismatch");
 
-    if n_rows >= MATVEC_BLOCK_THRESHOLD {
+    if should_use_argmax_block_kernel(n_rows) {
         let n_blocks = (n_rows + ARGMAX_BLOCK_ROWS - 1) / ARGMAX_BLOCK_ROWS;
         return (0..n_blocks)
             .into_par_iter()

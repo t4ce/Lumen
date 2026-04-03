@@ -7,7 +7,7 @@ use crate::module::Module;
 use crate::ops::fused::{fused_qkv_decode_infer_into, fused_softmax};
 use crate::ops::matmul::{batch_matmul, dot_unrolled};
 use crate::ops::shape::{permute, reshape};
-use crate::precision::{DType, default_runtime_dtype};
+use crate::precision::{DType, default_activation_dtype, default_kv_cache_dtype};
 
 use ndarray::Array4;
 use ndarray::linalg::general_mat_mul;
@@ -197,7 +197,7 @@ pub type KVCache = Rc<RefCell<KVCacheInner>>;
 
 impl KVCacheInner {
     pub fn new(b: usize, h_kv: usize, max_seq: usize, d: usize) -> Self {
-        Self::new_impl(b, h_kv, max_seq, d, default_runtime_dtype(), true)
+        Self::new_impl(b, h_kv, max_seq, d, default_kv_cache_dtype(), true)
     }
 
     fn new_impl(
@@ -337,10 +337,21 @@ pub struct SelfAttention {
     scale: f32,
     pub causal: bool,
     max_seq: usize, // 为 cache 预分配用
-    runtime_dtype: DType,
+    activation_dtype: DType,
+    kv_cache_dtype: DType,
 }
 
 impl SelfAttention {
+    #[inline]
+    pub fn activation_dtype(&self) -> DType {
+        self.activation_dtype
+    }
+
+    #[inline]
+    pub fn kv_cache_dtype(&self) -> DType {
+        self.kv_cache_dtype
+    }
+
     fn new_impl(
         embed_dim: usize,
         n_head: usize,
@@ -349,7 +360,8 @@ impl SelfAttention {
         rope_theta: f32,
         causal: bool,
         parameter_dtype: DType,
-        runtime_dtype: DType,
+        activation_dtype: DType,
+        kv_cache_dtype: DType,
     ) -> Self {
         assert!(embed_dim > 0, "embed_dim must be > 0");
         assert!(n_head > 0, "n_head must be > 0");
@@ -366,16 +378,21 @@ impl SelfAttention {
             "n_head must be divisible by n_kv_head"
         );
         assert!(
-            runtime_dtype.is_float(),
-            "SelfAttention runtime dtype currently only supports floating types, got {:?}",
-            runtime_dtype
+            activation_dtype.is_float(),
+            "SelfAttention activation dtype currently only supports floating types, got {:?}",
+            activation_dtype
+        );
+        assert!(
+            kv_cache_dtype.is_float(),
+            "SelfAttention KV cache dtype currently only supports floating types, got {:?}",
+            kv_cache_dtype
         );
 
         let head_dim = embed_dim / n_head;
         let kv_dim = n_kv_head * head_dim;
 
         let rope =
-            RotaryEmbedding::new_with_dtype(head_dim, max_seq_len, rope_theta, runtime_dtype);
+            RotaryEmbedding::new_with_dtype(head_dim, max_seq_len, rope_theta, activation_dtype);
 
         Self {
             w_q: Linear::new_no_bias_with_dtype(embed_dim, embed_dim, parameter_dtype),
@@ -389,8 +406,33 @@ impl SelfAttention {
             scale: (head_dim as f32).sqrt().recip(),
             causal,
             max_seq: max_seq_len, // 存储正确的最大长度
-            runtime_dtype,
+            activation_dtype,
+            kv_cache_dtype,
         }
+    }
+
+    pub fn new_with_runtime_dtypes(
+        embed_dim: usize,
+        n_head: usize,
+        n_kv_head: usize,
+        max_seq_len: usize,
+        rope_theta: f32,
+        causal: bool,
+        parameter_dtype: DType,
+        activation_dtype: DType,
+        kv_cache_dtype: DType,
+    ) -> Self {
+        Self::new_impl(
+            embed_dim,
+            n_head,
+            n_kv_head,
+            max_seq_len,
+            rope_theta,
+            causal,
+            parameter_dtype,
+            activation_dtype,
+            kv_cache_dtype,
+        )
     }
 
     pub fn new_with_dtypes(
@@ -403,7 +445,7 @@ impl SelfAttention {
         parameter_dtype: DType,
         runtime_dtype: DType,
     ) -> Self {
-        Self::new_impl(
+        Self::new_with_runtime_dtypes(
             embed_dim,
             n_head,
             n_kv_head,
@@ -411,6 +453,7 @@ impl SelfAttention {
             rope_theta,
             causal,
             parameter_dtype,
+            runtime_dtype,
             runtime_dtype,
         )
     }
@@ -438,17 +481,23 @@ impl SelfAttention {
             "n_head must be divisible by n_kv_head"
         );
 
-        let runtime_dtype = default_runtime_dtype();
+        let activation_dtype = default_activation_dtype();
+        let kv_cache_dtype = default_kv_cache_dtype();
         assert!(
-            runtime_dtype.is_float(),
-            "SelfAttention runtime dtype currently only supports floating types, got {:?}",
-            runtime_dtype
+            activation_dtype.is_float(),
+            "SelfAttention activation dtype currently only supports floating types, got {:?}",
+            activation_dtype
+        );
+        assert!(
+            kv_cache_dtype.is_float(),
+            "SelfAttention KV cache dtype currently only supports floating types, got {:?}",
+            kv_cache_dtype
         );
 
         let head_dim = embed_dim / n_head;
         let kv_dim = n_kv_head * head_dim;
         let rope =
-            RotaryEmbedding::new_with_dtype(head_dim, max_seq_len, rope_theta, runtime_dtype);
+            RotaryEmbedding::new_with_dtype(head_dim, max_seq_len, rope_theta, activation_dtype);
 
         Self {
             w_q: Linear::new_no_bias(embed_dim, embed_dim),
@@ -462,7 +511,8 @@ impl SelfAttention {
             scale: (head_dim as f32).sqrt().recip(),
             causal,
             max_seq: max_seq_len,
-            runtime_dtype,
+            activation_dtype,
+            kv_cache_dtype,
         }
     }
 
@@ -482,6 +532,7 @@ impl SelfAttention {
             max_seq_len,
             rope_theta,
             causal,
+            dtype,
             dtype,
             dtype,
         )
@@ -536,7 +587,7 @@ impl SelfAttention {
                     h_kv,
                     self.max_seq,
                     d,
-                    self.runtime_dtype,
+                    self.kv_cache_dtype,
                 ))),
             };
             self.assert_cache_compatible(&cache_handle, b, "SelfAttention KV cache");

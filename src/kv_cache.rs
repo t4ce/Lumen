@@ -1,5 +1,5 @@
 use crate::autograd::{StoragePreference, Tensor, TensorStorageView, TensorStorageViewMut};
-use crate::precision::{DType, default_runtime_dtype};
+use crate::precision::{DType, default_kv_cache_dtype};
 use half::f16;
 use ndarray::{Array4, s};
 
@@ -107,7 +107,7 @@ fn native_cache_prefix(cache: &Tensor, current_len: usize) -> Tensor {
 
 impl LlamaKVCache {
     pub fn new(config: &crate::models::LlamaConfig) -> Self {
-        Self::new_impl(config, default_runtime_dtype(), true)
+        Self::new_impl(config, default_kv_cache_dtype(), true)
     }
 
     fn new_impl(
