@@ -838,30 +838,9 @@ fn matvec_rowmajor_serial_f32_i8(
     k_dim: usize,
     out: &mut [f32],
 ) {
-    #[cfg(all(feature = "arm64-int8-kernels", target_arch = "aarch64"))]
-    {
-        let mut i = 0usize;
-        while i + 1 < n_rows {
-            let row0 = &w_rowmajor[i * k_dim..(i + 1) * k_dim];
-            let row1 = &w_rowmajor[(i + 1) * k_dim..(i + 2) * k_dim];
-            let (s0, s1) = dot2_unrolled_f32_i8(x, row0, scale, row1, scale);
-            out[i] = s0;
-            out[i + 1] = s1;
-            i += 2;
-        }
-        if i < n_rows {
-            let row = &w_rowmajor[i * k_dim..(i + 1) * k_dim];
-            out[i] = dot_unrolled_f32_i8(x, row, scale);
-        }
-        return;
-    }
-
-    #[cfg(not(all(feature = "arm64-int8-kernels", target_arch = "aarch64")))]
-    {
-        for i in 0..n_rows {
-            let row = &w_rowmajor[i * k_dim..(i + 1) * k_dim];
-            out[i] = dot_unrolled_f32_i8(x, row, scale);
-        }
+    for i in 0..n_rows {
+        let row = &w_rowmajor[i * k_dim..(i + 1) * k_dim];
+        out[i] = dot_unrolled_f32_i8(x, row, scale);
     }
 }
 
@@ -953,34 +932,10 @@ fn matvec_rowmajor_rowwise_parallel_f32_i8(
         .enumerate()
         .for_each(|(chunk_idx, out_chunk)| {
             let row_start = chunk_idx * MATVEC_I8_PAR_CHUNK_ROWS;
-
-            #[cfg(all(feature = "arm64-int8-kernels", target_arch = "aarch64"))]
-            {
-                let mut offset = 0usize;
-                while offset + 1 < out_chunk.len() {
-                    let row0_idx = row_start + offset;
-                    let row1_idx = row0_idx + 1;
-                    let row0 = &w_rowmajor[row0_idx * k_dim..(row0_idx + 1) * k_dim];
-                    let row1 = &w_rowmajor[row1_idx * k_dim..(row1_idx + 1) * k_dim];
-                    let (s0, s1) = dot2_unrolled_f32_i8(x, row0, scale, row1, scale);
-                    out_chunk[offset] = s0;
-                    out_chunk[offset + 1] = s1;
-                    offset += 2;
-                }
-                if offset < out_chunk.len() {
-                    let row_idx = row_start + offset;
-                    let row = &w_rowmajor[row_idx * k_dim..(row_idx + 1) * k_dim];
-                    out_chunk[offset] = dot_unrolled_f32_i8(x, row, scale);
-                }
-            }
-
-            #[cfg(not(all(feature = "arm64-int8-kernels", target_arch = "aarch64")))]
-            {
-                for (offset, out_val) in out_chunk.iter_mut().enumerate() {
-                    let row_idx = row_start + offset;
-                    let row = &w_rowmajor[row_idx * k_dim..(row_idx + 1) * k_dim];
-                    *out_val = dot_unrolled_f32_i8(x, row, scale);
-                }
+            for (offset, out_val) in out_chunk.iter_mut().enumerate() {
+                let row_idx = row_start + offset;
+                let row = &w_rowmajor[row_idx * k_dim..(row_idx + 1) * k_dim];
+                *out_val = dot_unrolled_f32_i8(x, row, scale);
             }
         });
 }
@@ -1369,70 +1324,19 @@ pub fn matvec_rowmajor_parallel_i8_i8(
     assert_eq!(out.len(), n_rows, "out size mismatch");
 
     if n_rows < MATVEC_PAR_THRESHOLD {
-        #[cfg(all(feature = "arm64-int8-kernels", target_arch = "aarch64"))]
-        {
-            let mut i = 0usize;
-            while i + 1 < n_rows {
-                let row0 = &w_rowmajor[i * k_dim..(i + 1) * k_dim];
-                let row1 = &w_rowmajor[(i + 1) * k_dim..(i + 2) * k_dim];
-                let (s0, s1) = dot2_unrolled_i8_i8(x, x_scale, row0, w_scale, row1, w_scale);
-                out[i] = s0;
-                out[i + 1] = s1;
-                i += 2;
-            }
-            if i < n_rows {
-                let row = &w_rowmajor[i * k_dim..(i + 1) * k_dim];
-                out[i] = dot_unrolled_i8_i8(x, x_scale, row, w_scale);
-            }
-        }
-
-        #[cfg(not(all(feature = "arm64-int8-kernels", target_arch = "aarch64")))]
-        {
-            for i in 0..n_rows {
-                let row = &w_rowmajor[i * k_dim..(i + 1) * k_dim];
-                out[i] = dot_unrolled_i8_i8(x, x_scale, row, w_scale);
-            }
+        for i in 0..n_rows {
+            let row = &w_rowmajor[i * k_dim..(i + 1) * k_dim];
+            out[i] = dot_unrolled_i8_i8(x, x_scale, row, w_scale);
         }
     } else {
         out.par_chunks_mut(MATVEC_I8_PAR_CHUNK_ROWS)
             .enumerate()
             .for_each(|(chunk_idx, out_chunk)| {
                 let row_start = chunk_idx * MATVEC_I8_PAR_CHUNK_ROWS;
-
-                #[cfg(all(feature = "arm64-int8-kernels", target_arch = "aarch64"))]
-                {
-                    let mut offset = 0usize;
-                    while offset + 1 < out_chunk.len() {
-                        let row0_idx = row_start + offset;
-                        let row1_idx = row0_idx + 1;
-                        let row0 = &w_rowmajor[row0_idx * k_dim..(row0_idx + 1) * k_dim];
-                        let row1 = &w_rowmajor[row1_idx * k_dim..(row1_idx + 1) * k_dim];
-                        let (s0, s1) = dot2_unrolled_i8_i8(
-                            x,
-                            x_scale,
-                            row0,
-                            w_scale,
-                            row1,
-                            w_scale,
-                        );
-                        out_chunk[offset] = s0;
-                        out_chunk[offset + 1] = s1;
-                        offset += 2;
-                    }
-                    if offset < out_chunk.len() {
-                        let row_idx = row_start + offset;
-                        let row = &w_rowmajor[row_idx * k_dim..(row_idx + 1) * k_dim];
-                        out_chunk[offset] = dot_unrolled_i8_i8(x, x_scale, row, w_scale);
-                    }
-                }
-
-                #[cfg(not(all(feature = "arm64-int8-kernels", target_arch = "aarch64")))]
-                {
-                    for (offset, out_val) in out_chunk.iter_mut().enumerate() {
-                        let row_idx = row_start + offset;
-                        let row = &w_rowmajor[row_idx * k_dim..(row_idx + 1) * k_dim];
-                        *out_val = dot_unrolled_i8_i8(x, x_scale, row, w_scale);
-                    }
+                for (offset, out_val) in out_chunk.iter_mut().enumerate() {
+                    let row_idx = row_start + offset;
+                    let row = &w_rowmajor[row_idx * k_dim..(row_idx + 1) * k_dim];
+                    *out_val = dot_unrolled_i8_i8(x, x_scale, row, w_scale);
                 }
             });
     }

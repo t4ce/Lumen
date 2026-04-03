@@ -484,11 +484,6 @@ impl LlamaModel {
         let activation_dtype = default_activation_dtype();
         let kv_cache_dtype = default_kv_cache_dtype();
         assert!(
-            activation_dtype.is_float(),
-            "LlamaModel activation dtype currently only supports floating types, got {:?}",
-            activation_dtype
-        );
-        assert!(
             kv_cache_dtype.is_float(),
             "LlamaModel KV cache dtype currently only supports floating types, got {:?}",
             kv_cache_dtype
@@ -549,11 +544,6 @@ impl LlamaModel {
         kv_cache_dtype: DType,
     ) -> Self {
         config.validate();
-        assert!(
-            activation_dtype.is_float(),
-            "LlamaModel activation dtype currently only supports floating types, got {:?}",
-            activation_dtype
-        );
         assert!(
             kv_cache_dtype.is_float(),
             "LlamaModel KV cache dtype currently only supports floating types, got {:?}",
@@ -1092,6 +1082,14 @@ mod tests {
                 TensorStorageOwned::I8(_, _) => panic!("last hidden token should stay bf16"),
             }
         });
+    }
+
+    #[test]
+    fn llama_model_allows_i8_activation_dtype_with_float_kv_cache() {
+        let model =
+            LlamaModel::new_with_runtime_dtypes(test_config(), DType::I8, DType::I8, DType::BF16);
+        assert_eq!(model.activation_dtype(), DType::I8);
+        assert_eq!(model.kv_cache_dtype(), DType::BF16);
     }
 
     #[test]

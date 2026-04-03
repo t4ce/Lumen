@@ -135,13 +135,23 @@ pub fn preferred_parameter_storage_for_route(
 ) -> StoragePreference {
     match classify_dtype_dispatch(input_dtype, tensor_dtype) {
         DTypeDispatch::PureF32 => StoragePreference::Auto,
-        DTypeDispatch::SameBF16 => match route {
-            KernelRouteClass::GenericMatmul => StoragePreference::Auto,
-            KernelRouteClass::DecodeKernel | KernelRouteClass::Argmax => StoragePreference::Native,
-        },
-        DTypeDispatch::SameF16 => StoragePreference::Auto,
-        DTypeDispatch::SameI8 => StoragePreference::Native,
-        DTypeDispatch::Mixed => StoragePreference::Auto,
+        DTypeDispatch::SameBF16 | DTypeDispatch::SameF16 | DTypeDispatch::SameI8 => {
+            StoragePreference::Native
+        }
+        DTypeDispatch::Mixed => {
+            #[cfg(all(feature = "arm64-fp-kernels", target_arch = "aarch64"))]
+            {
+                if matches!(route, KernelRouteClass::GenericMatmul)
+                    && input_dtype == DType::F32
+                    && matches!(tensor_dtype, DType::BF16 | DType::F16)
+                {
+                    return StoragePreference::Native;
+                }
+            }
+
+            let _ = route;
+            StoragePreference::Auto
+        }
     }
 }
 
@@ -2423,21 +2433,35 @@ mod tests {
             || {
                 let param = Tensor::parameter(ArrayD::from_elem(IxDyn(&[4]), 3.0));
 
-                param.with_storage_view_for_input_dtype(DType::F32, |view| match view {
-                    TensorStorageView::F32(view) => assert_eq!(view.len(), 4),
-                    TensorStorageView::F16(_) => panic!(
-                        "mixed f32 input should still be allowed to use cached f32 parameter view"
-                    ),
-                    TensorStorageView::BF16(_) => panic!(
-                        "mixed f32 input should still be allowed to use cached f32 parameter view"
-                    ),
+                param.with_storage_view_for_input_dtype(DType::F32, |view| {
+                    #[cfg(all(feature = "arm64-fp-kernels", target_arch = "aarch64"))]
+                    match view {
+                        TensorStorageView::BF16(view) => assert_eq!(view.len(), 4),
+                        TensorStorageView::F16(_) => {
+                            panic!("mixed f32 generic-dispatch on arm should keep native bf16 parameter view")
+                        }
+                        TensorStorageView::F32(_) => {
+                            panic!("mixed f32 generic-dispatch on arm should keep native bf16 parameter view")
+                        }
+                    }
+
+                    #[cfg(not(all(feature = "arm64-fp-kernels", target_arch = "aarch64")))]
+                    match view {
+                        TensorStorageView::F32(view) => assert_eq!(view.len(), 4),
+                        TensorStorageView::F16(_) => panic!(
+                            "mixed f32 input should still be allowed to use cached f32 parameter view"
+                        ),
+                        TensorStorageView::BF16(_) => panic!(
+                            "mixed f32 input should still be allowed to use cached f32 parameter view"
+                        ),
+                    }
                 });
             },
         );
     }
 
     #[test]
-    fn generic_matmul_route_keeps_cached_f32_view_for_same_bf16_parameter_use() {
+    fn generic_matmul_route_prefers_native_low_precision_parameter_view_on_arm() {
         with_precision_config(
             PrecisionConfig {
                 parameter_dtype: DType::BF16,
@@ -2448,15 +2472,29 @@ mod tests {
                 let param = Tensor::parameter(ArrayD::from_elem(IxDyn(&[4]), 3.0));
 
                 param.with_storage_view_for_input_dtype_and_route(
-                    DType::BF16,
+                    DType::F32,
                     KernelRouteClass::GenericMatmul,
-                    |view| match view {
-                        TensorStorageView::F32(view) => assert_eq!(view.len(), 4),
-                        TensorStorageView::F16(_) => {
-                            panic!("generic matmul should still be allowed to use cached f32 parameter view")
+                    |view| {
+                        #[cfg(all(feature = "arm64-fp-kernels", target_arch = "aarch64"))]
+                        match view {
+                            TensorStorageView::BF16(view) => assert_eq!(view.len(), 4),
+                            TensorStorageView::F16(_) => {
+                                panic!("generic matmul on arm should keep native bf16 parameter view")
+                            }
+                            TensorStorageView::F32(_) => {
+                                panic!("generic matmul on arm should keep native bf16 parameter view")
+                            }
                         }
-                        TensorStorageView::BF16(_) => {
-                            panic!("generic matmul should still be allowed to use cached f32 parameter view")
+
+                        #[cfg(not(all(feature = "arm64-fp-kernels", target_arch = "aarch64")))]
+                        match view {
+                            TensorStorageView::F32(view) => assert_eq!(view.len(), 4),
+                            TensorStorageView::F16(_) => {
+                                panic!("generic matmul should still be allowed to use cached f32 parameter view")
+                            }
+                            TensorStorageView::BF16(_) => {
+                                panic!("generic matmul should still be allowed to use cached f32 parameter view")
+                            }
                         }
                     },
                 );

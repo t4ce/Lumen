@@ -4,10 +4,11 @@ use crate::autograd::{
 use crate::ops::matmul::{
     SliceRef, dual_matvec_rowmajor_parallel_mixed, dual_matvec_silu_mul_rowmajor_parallel_f32_bf16,
     dual_matvec_silu_mul_rowmajor_parallel_f32_f16, dual_matvec_silu_mul_rowmajor_parallel_f32_i8,
-    dual_matvec_silu_mul_rowmajor_parallel_mixed, matvec_rowmajor_parallel_mixed,
-    qkv_matvec_rowmajor_parallel, qkv_matvec_rowmajor_parallel_f32_bf16,
-    qkv_matvec_rowmajor_parallel_f32_f16, qkv_matvec_rowmajor_parallel_f32_i8,
-    with_bf16_input_as_f32, with_f16_input_as_f32,
+    dual_matvec_silu_mul_rowmajor_parallel_i8_i8, dual_matvec_silu_mul_rowmajor_parallel_mixed,
+    matvec_rowmajor_parallel_mixed, qkv_matvec_rowmajor_parallel,
+    qkv_matvec_rowmajor_parallel_f32_bf16, qkv_matvec_rowmajor_parallel_f32_f16,
+    qkv_matvec_rowmajor_parallel_f32_i8, qkv_matvec_rowmajor_parallel_i8_i8,
+    with_bf16_input_as_f32, with_f16_input_as_f32, with_i8_input_as_f32,
 };
 use crate::precision::DType;
 use half::{bf16, f16};
@@ -363,6 +364,18 @@ fn run_qkv_slices(
             });
         }
         (
+            SliceRef::I8(x_i8, x_scale),
+            SliceRef::F32(q_slice),
+            SliceRef::F32(k_slice),
+            SliceRef::F32(v_slice),
+        ) => {
+            with_i8_input_as_f32(x_i8, x_scale, |x_f32| {
+                qkv_matvec_rowmajor_parallel(
+                    x_f32, q_slice, k_slice, v_slice, q_n, k_n, k_dim, q_out, k_out, v_out,
+                );
+            });
+        }
+        (
             SliceRef::F32(x_f32),
             SliceRef::BF16(q_slice),
             SliceRef::BF16(k_slice),
@@ -379,6 +392,18 @@ fn run_qkv_slices(
             SliceRef::BF16(v_slice),
         ) => {
             with_bf16_input_as_f32(x_bf16, |x_f32| {
+                qkv_matvec_rowmajor_parallel_f32_bf16(
+                    x_f32, q_slice, k_slice, v_slice, q_n, k_n, k_dim, q_out, k_out, v_out,
+                );
+            });
+        }
+        (
+            SliceRef::I8(x_i8, x_scale),
+            SliceRef::BF16(q_slice),
+            SliceRef::BF16(k_slice),
+            SliceRef::BF16(v_slice),
+        ) => {
+            with_i8_input_as_f32(x_i8, x_scale, |x_f32| {
                 qkv_matvec_rowmajor_parallel_f32_bf16(
                     x_f32, q_slice, k_slice, v_slice, q_n, k_n, k_dim, q_out, k_out, v_out,
                 );
@@ -420,6 +445,17 @@ fn run_qkv_slices(
                     q_out, k_out, v_out,
                 );
             });
+        }
+        (
+            SliceRef::I8(x_i8, x_scale),
+            SliceRef::I8(q_slice, q_scale),
+            SliceRef::I8(k_slice, k_scale),
+            SliceRef::I8(v_slice, v_scale),
+        ) => {
+            qkv_matvec_rowmajor_parallel_i8_i8(
+                x_i8, x_scale, q_slice, q_scale, k_slice, k_scale, v_slice, v_scale, q_n, k_n,
+                k_dim, q_out, k_out, v_out,
+            );
         }
         (x_slice, q_slice, k_slice, v_slice) => {
             matvec_rowmajor_parallel_mixed(x_slice, q_slice, q_n, k_dim, q_out);
@@ -463,6 +499,13 @@ fn run_gate_up_slice(
                 );
             });
         }
+        (SliceRef::I8(x_i8, x_scale), SliceRef::BF16(gate_slice), SliceRef::BF16(up_slice)) => {
+            with_i8_input_as_f32(x_i8, x_scale, |x_f32| {
+                dual_matvec_silu_mul_rowmajor_parallel_f32_bf16(
+                    x_f32, gate_slice, up_slice, n_dim, k_dim, out,
+                );
+            });
+        }
         (
             SliceRef::F32(x_f32),
             SliceRef::I8(gate_slice, gate_scale),
@@ -493,6 +536,15 @@ fn run_gate_up_slice(
                     x_f32, gate_slice, gate_scale, up_slice, up_scale, n_dim, k_dim, out,
                 );
             });
+        }
+        (
+            SliceRef::I8(x_i8, x_scale),
+            SliceRef::I8(gate_slice, gate_scale),
+            SliceRef::I8(up_slice, up_scale),
+        ) => {
+            dual_matvec_silu_mul_rowmajor_parallel_i8_i8(
+                x_i8, x_scale, gate_slice, gate_scale, up_slice, up_scale, n_dim, k_dim, out,
+            );
         }
         (x_slice, gate_slice, up_slice) => {
             dual_matvec_silu_mul_rowmajor_parallel_mixed(
@@ -2144,6 +2196,100 @@ mod tests {
 
         no_grad(|| {
             fused_gate_up_silu_infer_into(&input, &gate_ref, &up_ref, &mut ref_out);
+            fused_gate_up_silu_infer_into(&input, &gate_i8, &up_i8, &mut out);
+        });
+
+        assert_close(&ref_out, &out, 1e-5);
+    }
+
+    #[test]
+    fn fused_qkv_i8_input_i8_matches_quantized_reference() {
+        let hidden = 8usize;
+        let x = sample_f32(hidden)
+            .into_iter()
+            .map(|v| v * 0.8 - 0.1)
+            .collect::<Vec<_>>();
+        let q = sample_f32(hidden * hidden);
+        let k = sample_f32(hidden * hidden)
+            .into_iter()
+            .map(|v| v * 0.7 - 0.1)
+            .collect::<Vec<_>>();
+        let v = sample_f32(hidden * hidden)
+            .into_iter()
+            .map(|v| v * -0.4 + 0.05)
+            .collect::<Vec<_>>();
+
+        let x_q = quantize_i8(&[1, 1, hidden], &x);
+        let q_q = quantize_i8(&[hidden, hidden], &q);
+        let k_q = quantize_i8(&[hidden, hidden], &k);
+        let v_q = quantize_i8(&[hidden, hidden], &v);
+
+        let input_ref = make_tensor(&[1, 1, hidden], x_q, DType::F32);
+        let input = make_tensor(&[1, 1, hidden], x, DType::I8);
+        let q_ref = make_tensor(&[hidden, hidden], q_q, DType::F32);
+        let k_ref = make_tensor(&[hidden, hidden], k_q, DType::F32);
+        let v_ref = make_tensor(&[hidden, hidden], v_q, DType::F32);
+        let q_i8 = make_tensor(&[hidden, hidden], q, DType::I8);
+        let k_i8 = make_tensor(&[hidden, hidden], k, DType::I8);
+        let v_i8 = make_tensor(&[hidden, hidden], v, DType::I8);
+
+        let mut q_expected = vec![0.0f32; hidden];
+        let mut k_expected = vec![0.0f32; hidden];
+        let mut v_expected = vec![0.0f32; hidden];
+        let mut q_out = vec![0.0f32; hidden];
+        let mut k_out = vec![0.0f32; hidden];
+        let mut v_out = vec![0.0f32; hidden];
+
+        no_grad(|| {
+            fused_qkv_decode_infer_into(
+                &input_ref,
+                &q_ref,
+                &k_ref,
+                &v_ref,
+                &mut q_expected,
+                &mut k_expected,
+                &mut v_expected,
+            );
+            fused_qkv_decode_infer_into(
+                &input, &q_i8, &k_i8, &v_i8, &mut q_out, &mut k_out, &mut v_out,
+            );
+        });
+
+        assert_close(&q_expected, &q_out, 1e-5);
+        assert_close(&k_expected, &k_out, 1e-5);
+        assert_close(&v_expected, &v_out, 1e-5);
+    }
+
+    #[test]
+    fn fused_gateup_i8_input_i8_matches_quantized_reference() {
+        let hidden = 8usize;
+        let inter = 12usize;
+        let x = sample_f32(hidden)
+            .into_iter()
+            .map(|v| v * 0.75 - 0.05)
+            .collect::<Vec<_>>();
+        let gate = sample_f32(inter * hidden);
+        let up = sample_f32(inter * hidden)
+            .into_iter()
+            .map(|v| v * 0.5 - 0.2)
+            .collect::<Vec<_>>();
+
+        let x_q = quantize_i8(&[1, 1, hidden], &x);
+        let gate_q = quantize_i8(&[inter, hidden], &gate);
+        let up_q = quantize_i8(&[inter, hidden], &up);
+
+        let input_ref = make_tensor(&[1, 1, hidden], x_q, DType::F32);
+        let input = make_tensor(&[1, 1, hidden], x, DType::I8);
+        let gate_ref = make_tensor(&[inter, hidden], gate_q, DType::F32);
+        let up_ref = make_tensor(&[inter, hidden], up_q, DType::F32);
+        let gate_i8 = make_tensor(&[inter, hidden], gate, DType::I8);
+        let up_i8 = make_tensor(&[inter, hidden], up, DType::I8);
+
+        let mut ref_out = vec![0.0f32; inter];
+        let mut out = vec![0.0f32; inter];
+
+        no_grad(|| {
+            fused_gate_up_silu_infer_into(&input_ref, &gate_ref, &up_ref, &mut ref_out);
             fused_gate_up_silu_infer_into(&input, &gate_i8, &up_i8, &mut out);
         });
 

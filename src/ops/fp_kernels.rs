@@ -1,6 +1,11 @@
 use crate::arch;
 use half::{bf16, f16};
 
+#[cfg(all(feature = "x86-fp-kernels", target_arch = "x86"))]
+use std::arch::x86::__m256;
+#[cfg(all(feature = "x86-fp-kernels", target_arch = "x86_64"))]
+use std::arch::x86_64::__m256;
+
 #[inline]
 fn dot_len_matches<T>(x: &[f32], row: &[T]) -> bool {
     x.len() == row.len()
@@ -121,6 +126,12 @@ pub fn dot_f32_f16_arch(_x: &[f32], _row: &[f16]) -> Option<f32> {
         #[cfg(all(feature = "arm64-fp-kernels", target_arch = "aarch64"))]
         FloatKernelBackend::Arm64Neon => arch::arm64_fp16_kernel_runtime_available()
             .then(|| unsafe { dot_f32_f16_arm64_neon(_x, _row) }),
+        #[cfg(all(
+            feature = "x86-fp-kernels",
+            any(target_arch = "x86_64", target_arch = "x86")
+        ))]
+        FloatKernelBackend::X86Avx2 => arch::x86_fp16_kernel_runtime_available()
+            .then(|| unsafe { dot_f32_f16_x86_avx2(_x, _row) }),
         #[allow(unreachable_patterns)]
         _ => None,
     }
@@ -137,6 +148,12 @@ pub fn dot2_f32_f16_arch(_x: &[f32], _row0: &[f16], _row1: &[f16]) -> Option<(f3
         #[cfg(all(feature = "arm64-fp-kernels", target_arch = "aarch64"))]
         FloatKernelBackend::Arm64Neon => arch::arm64_fp16_kernel_runtime_available()
             .then(|| unsafe { dot2_f32_f16_arm64_neon(_x, _row0, _row1) }),
+        #[cfg(all(
+            feature = "x86-fp-kernels",
+            any(target_arch = "x86_64", target_arch = "x86")
+        ))]
+        FloatKernelBackend::X86Avx2 => arch::x86_fp16_kernel_runtime_available()
+            .then(|| unsafe { dot2_f32_f16_x86_avx2(_x, _row0, _row1) }),
         #[allow(unreachable_patterns)]
         _ => None,
     }
@@ -158,6 +175,12 @@ pub fn dot3_f32_f16_arch(
         #[cfg(all(feature = "arm64-fp-kernels", target_arch = "aarch64"))]
         FloatKernelBackend::Arm64Neon => arch::arm64_fp16_kernel_runtime_available()
             .then(|| unsafe { dot3_f32_f16_arm64_neon(_x, _row0, _row1, _row2) }),
+        #[cfg(all(
+            feature = "x86-fp-kernels",
+            any(target_arch = "x86_64", target_arch = "x86")
+        ))]
+        FloatKernelBackend::X86Avx2 => arch::x86_fp16_kernel_runtime_available()
+            .then(|| unsafe { dot3_f32_f16_x86_avx2(_x, _row0, _row1, _row2) }),
         #[allow(unreachable_patterns)]
         _ => None,
     }
@@ -173,6 +196,11 @@ pub fn dot_f32_bf16_arch(_x: &[f32], _row: &[bf16]) -> Option<f32> {
         FloatKernelBackend::Portable => None,
         #[cfg(all(feature = "arm64-fp-kernels", target_arch = "aarch64"))]
         FloatKernelBackend::Arm64Neon => Some(unsafe { dot_f32_bf16_arm64_neon(_x, _row) }),
+        #[cfg(all(
+            feature = "x86-fp-kernels",
+            any(target_arch = "x86_64", target_arch = "x86")
+        ))]
+        FloatKernelBackend::X86Avx2 => Some(unsafe { dot_f32_bf16_x86_avx2(_x, _row) }),
         #[allow(unreachable_patterns)]
         _ => None,
     }
@@ -190,6 +218,11 @@ pub fn dot2_f32_bf16_arch(_x: &[f32], _row0: &[bf16], _row1: &[bf16]) -> Option<
         FloatKernelBackend::Arm64Neon => {
             Some(unsafe { dot2_f32_bf16_arm64_neon(_x, _row0, _row1) })
         }
+        #[cfg(all(
+            feature = "x86-fp-kernels",
+            any(target_arch = "x86_64", target_arch = "x86")
+        ))]
+        FloatKernelBackend::X86Avx2 => Some(unsafe { dot2_f32_bf16_x86_avx2(_x, _row0, _row1) }),
         #[allow(unreachable_patterns)]
         _ => None,
     }
@@ -212,6 +245,11 @@ pub fn dot3_f32_bf16_arch(
         FloatKernelBackend::Arm64Neon => {
             Some(unsafe { dot3_f32_bf16_arm64_neon(_x, _row0, _row1, _row2) })
         }
+        #[cfg(all(
+            feature = "x86-fp-kernels",
+            any(target_arch = "x86_64", target_arch = "x86")
+        ))]
+        FloatKernelBackend::X86Avx2 => Some(unsafe { dot3_f32_bf16_x86_avx2(_x, _row0, _row1, _row2) }),
         #[allow(unreachable_patterns)]
         _ => None,
     }
@@ -592,6 +630,379 @@ unsafe fn dot3_f32_bf16_arm64_neon(
     feature = "x86-fp-kernels",
     any(target_arch = "x86_64", target_arch = "x86")
 ))]
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn reduce_f32x8_x86(v: __m256) -> f32 {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let mut buf = [0.0f32; 8];
+    unsafe {
+        _mm256_storeu_ps(buf.as_mut_ptr(), v);
+    }
+    buf.iter().sum()
+}
+
+#[cfg(all(
+    feature = "x86-fp-kernels",
+    any(target_arch = "x86_64", target_arch = "x86")
+))]
+#[inline]
+#[target_feature(enable = "avx2,f16c")]
+unsafe fn load_f16_as_f32x8_x86(ptr: *const f16) -> __m256 {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let raw = unsafe { _mm_loadu_si128(ptr as *const __m128i) };
+    _mm256_cvtph_ps(raw)
+}
+
+#[cfg(all(
+    feature = "x86-fp-kernels",
+    any(target_arch = "x86_64", target_arch = "x86")
+))]
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn load_bf16_as_f32x8_x86(ptr: *const bf16) -> __m256 {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let raw = unsafe { _mm_loadu_si128(ptr as *const __m128i) };
+    let widened = _mm256_cvtepu16_epi32(raw);
+    let bits = _mm256_slli_epi32(widened, 16);
+    _mm256_castsi256_ps(bits)
+}
+
+#[cfg(all(
+    feature = "x86-fp-kernels",
+    any(target_arch = "x86_64", target_arch = "x86")
+))]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn dot_f32_f16_x86_avx2(x: &[f32], row: &[f16]) -> f32 {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let k_dim = x.len();
+    let mut kk = 0usize;
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+
+    while kk + 16 <= k_dim {
+        let row_lo = unsafe { load_f16_as_f32x8_x86(row.as_ptr().add(kk)) };
+        let row_hi = unsafe { load_f16_as_f32x8_x86(row.as_ptr().add(kk + 8)) };
+        let x_lo = unsafe { _mm256_loadu_ps(x.as_ptr().add(kk)) };
+        let x_hi = unsafe { _mm256_loadu_ps(x.as_ptr().add(kk + 8)) };
+        acc0 = _mm256_fmadd_ps(row_lo, x_lo, acc0);
+        acc1 = _mm256_fmadd_ps(row_hi, x_hi, acc1);
+        kk += 16;
+    }
+
+    while kk + 8 <= k_dim {
+        let row_chunk = unsafe { load_f16_as_f32x8_x86(row.as_ptr().add(kk)) };
+        let x_chunk = unsafe { _mm256_loadu_ps(x.as_ptr().add(kk)) };
+        acc0 = _mm256_fmadd_ps(row_chunk, x_chunk, acc0);
+        kk += 8;
+    }
+
+    let mut sum = unsafe { reduce_f32x8_x86(acc0) + reduce_f32x8_x86(acc1) };
+    while kk < k_dim {
+        sum += row[kk].to_f32() * x[kk];
+        kk += 1;
+    }
+    sum
+}
+
+#[cfg(all(
+    feature = "x86-fp-kernels",
+    any(target_arch = "x86_64", target_arch = "x86")
+))]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn dot2_f32_f16_x86_avx2(x: &[f32], row0: &[f16], row1: &[f16]) -> (f32, f32) {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let k_dim = x.len();
+    let mut kk = 0usize;
+    let mut acc00 = _mm256_setzero_ps();
+    let mut acc01 = _mm256_setzero_ps();
+    let mut acc10 = _mm256_setzero_ps();
+    let mut acc11 = _mm256_setzero_ps();
+
+    while kk + 16 <= k_dim {
+        let x_lo = unsafe { _mm256_loadu_ps(x.as_ptr().add(kk)) };
+        let x_hi = unsafe { _mm256_loadu_ps(x.as_ptr().add(kk + 8)) };
+        let row0_lo = unsafe { load_f16_as_f32x8_x86(row0.as_ptr().add(kk)) };
+        let row0_hi = unsafe { load_f16_as_f32x8_x86(row0.as_ptr().add(kk + 8)) };
+        let row1_lo = unsafe { load_f16_as_f32x8_x86(row1.as_ptr().add(kk)) };
+        let row1_hi = unsafe { load_f16_as_f32x8_x86(row1.as_ptr().add(kk + 8)) };
+        acc00 = _mm256_fmadd_ps(row0_lo, x_lo, acc00);
+        acc01 = _mm256_fmadd_ps(row0_hi, x_hi, acc01);
+        acc10 = _mm256_fmadd_ps(row1_lo, x_lo, acc10);
+        acc11 = _mm256_fmadd_ps(row1_hi, x_hi, acc11);
+        kk += 16;
+    }
+
+    while kk + 8 <= k_dim {
+        let x_chunk = unsafe { _mm256_loadu_ps(x.as_ptr().add(kk)) };
+        let row0_chunk = unsafe { load_f16_as_f32x8_x86(row0.as_ptr().add(kk)) };
+        let row1_chunk = unsafe { load_f16_as_f32x8_x86(row1.as_ptr().add(kk)) };
+        acc00 = _mm256_fmadd_ps(row0_chunk, x_chunk, acc00);
+        acc10 = _mm256_fmadd_ps(row1_chunk, x_chunk, acc10);
+        kk += 8;
+    }
+
+    let mut sum0 = unsafe { reduce_f32x8_x86(acc00) + reduce_f32x8_x86(acc01) };
+    let mut sum1 = unsafe { reduce_f32x8_x86(acc10) + reduce_f32x8_x86(acc11) };
+    while kk < k_dim {
+        let xv = x[kk];
+        sum0 += row0[kk].to_f32() * xv;
+        sum1 += row1[kk].to_f32() * xv;
+        kk += 1;
+    }
+    (sum0, sum1)
+}
+
+#[cfg(all(
+    feature = "x86-fp-kernels",
+    any(target_arch = "x86_64", target_arch = "x86")
+))]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn dot3_f32_f16_x86_avx2(
+    x: &[f32],
+    row0: &[f16],
+    row1: &[f16],
+    row2: &[f16],
+) -> (f32, f32, f32) {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let k_dim = x.len();
+    let mut kk = 0usize;
+    let mut acc00 = _mm256_setzero_ps();
+    let mut acc01 = _mm256_setzero_ps();
+    let mut acc10 = _mm256_setzero_ps();
+    let mut acc11 = _mm256_setzero_ps();
+    let mut acc20 = _mm256_setzero_ps();
+    let mut acc21 = _mm256_setzero_ps();
+
+    while kk + 16 <= k_dim {
+        let x_lo = unsafe { _mm256_loadu_ps(x.as_ptr().add(kk)) };
+        let x_hi = unsafe { _mm256_loadu_ps(x.as_ptr().add(kk + 8)) };
+        let row0_lo = unsafe { load_f16_as_f32x8_x86(row0.as_ptr().add(kk)) };
+        let row0_hi = unsafe { load_f16_as_f32x8_x86(row0.as_ptr().add(kk + 8)) };
+        let row1_lo = unsafe { load_f16_as_f32x8_x86(row1.as_ptr().add(kk)) };
+        let row1_hi = unsafe { load_f16_as_f32x8_x86(row1.as_ptr().add(kk + 8)) };
+        let row2_lo = unsafe { load_f16_as_f32x8_x86(row2.as_ptr().add(kk)) };
+        let row2_hi = unsafe { load_f16_as_f32x8_x86(row2.as_ptr().add(kk + 8)) };
+        acc00 = _mm256_fmadd_ps(row0_lo, x_lo, acc00);
+        acc01 = _mm256_fmadd_ps(row0_hi, x_hi, acc01);
+        acc10 = _mm256_fmadd_ps(row1_lo, x_lo, acc10);
+        acc11 = _mm256_fmadd_ps(row1_hi, x_hi, acc11);
+        acc20 = _mm256_fmadd_ps(row2_lo, x_lo, acc20);
+        acc21 = _mm256_fmadd_ps(row2_hi, x_hi, acc21);
+        kk += 16;
+    }
+
+    while kk + 8 <= k_dim {
+        let x_chunk = unsafe { _mm256_loadu_ps(x.as_ptr().add(kk)) };
+        let row0_chunk = unsafe { load_f16_as_f32x8_x86(row0.as_ptr().add(kk)) };
+        let row1_chunk = unsafe { load_f16_as_f32x8_x86(row1.as_ptr().add(kk)) };
+        let row2_chunk = unsafe { load_f16_as_f32x8_x86(row2.as_ptr().add(kk)) };
+        acc00 = _mm256_fmadd_ps(row0_chunk, x_chunk, acc00);
+        acc10 = _mm256_fmadd_ps(row1_chunk, x_chunk, acc10);
+        acc20 = _mm256_fmadd_ps(row2_chunk, x_chunk, acc20);
+        kk += 8;
+    }
+
+    let mut sum0 = unsafe { reduce_f32x8_x86(acc00) + reduce_f32x8_x86(acc01) };
+    let mut sum1 = unsafe { reduce_f32x8_x86(acc10) + reduce_f32x8_x86(acc11) };
+    let mut sum2 = unsafe { reduce_f32x8_x86(acc20) + reduce_f32x8_x86(acc21) };
+    while kk < k_dim {
+        let xv = x[kk];
+        sum0 += row0[kk].to_f32() * xv;
+        sum1 += row1[kk].to_f32() * xv;
+        sum2 += row2[kk].to_f32() * xv;
+        kk += 1;
+    }
+    (sum0, sum1, sum2)
+}
+
+#[cfg(all(
+    feature = "x86-fp-kernels",
+    any(target_arch = "x86_64", target_arch = "x86")
+))]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_f32_bf16_x86_avx2(x: &[f32], row: &[bf16]) -> f32 {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let k_dim = x.len();
+    let mut kk = 0usize;
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+
+    while kk + 16 <= k_dim {
+        let row_lo = unsafe { load_bf16_as_f32x8_x86(row.as_ptr().add(kk)) };
+        let row_hi = unsafe { load_bf16_as_f32x8_x86(row.as_ptr().add(kk + 8)) };
+        let x_lo = unsafe { _mm256_loadu_ps(x.as_ptr().add(kk)) };
+        let x_hi = unsafe { _mm256_loadu_ps(x.as_ptr().add(kk + 8)) };
+        acc0 = _mm256_fmadd_ps(row_lo, x_lo, acc0);
+        acc1 = _mm256_fmadd_ps(row_hi, x_hi, acc1);
+        kk += 16;
+    }
+
+    while kk + 8 <= k_dim {
+        let row_chunk = unsafe { load_bf16_as_f32x8_x86(row.as_ptr().add(kk)) };
+        let x_chunk = unsafe { _mm256_loadu_ps(x.as_ptr().add(kk)) };
+        acc0 = _mm256_fmadd_ps(row_chunk, x_chunk, acc0);
+        kk += 8;
+    }
+
+    let mut sum = unsafe { reduce_f32x8_x86(acc0) + reduce_f32x8_x86(acc1) };
+    while kk < k_dim {
+        sum += row[kk].to_f32() * x[kk];
+        kk += 1;
+    }
+    sum
+}
+
+#[cfg(all(
+    feature = "x86-fp-kernels",
+    any(target_arch = "x86_64", target_arch = "x86")
+))]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot2_f32_bf16_x86_avx2(x: &[f32], row0: &[bf16], row1: &[bf16]) -> (f32, f32) {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let k_dim = x.len();
+    let mut kk = 0usize;
+    let mut acc00 = _mm256_setzero_ps();
+    let mut acc01 = _mm256_setzero_ps();
+    let mut acc10 = _mm256_setzero_ps();
+    let mut acc11 = _mm256_setzero_ps();
+
+    while kk + 16 <= k_dim {
+        let x_lo = unsafe { _mm256_loadu_ps(x.as_ptr().add(kk)) };
+        let x_hi = unsafe { _mm256_loadu_ps(x.as_ptr().add(kk + 8)) };
+        let row0_lo = unsafe { load_bf16_as_f32x8_x86(row0.as_ptr().add(kk)) };
+        let row0_hi = unsafe { load_bf16_as_f32x8_x86(row0.as_ptr().add(kk + 8)) };
+        let row1_lo = unsafe { load_bf16_as_f32x8_x86(row1.as_ptr().add(kk)) };
+        let row1_hi = unsafe { load_bf16_as_f32x8_x86(row1.as_ptr().add(kk + 8)) };
+        acc00 = _mm256_fmadd_ps(row0_lo, x_lo, acc00);
+        acc01 = _mm256_fmadd_ps(row0_hi, x_hi, acc01);
+        acc10 = _mm256_fmadd_ps(row1_lo, x_lo, acc10);
+        acc11 = _mm256_fmadd_ps(row1_hi, x_hi, acc11);
+        kk += 16;
+    }
+
+    while kk + 8 <= k_dim {
+        let x_chunk = unsafe { _mm256_loadu_ps(x.as_ptr().add(kk)) };
+        let row0_chunk = unsafe { load_bf16_as_f32x8_x86(row0.as_ptr().add(kk)) };
+        let row1_chunk = unsafe { load_bf16_as_f32x8_x86(row1.as_ptr().add(kk)) };
+        acc00 = _mm256_fmadd_ps(row0_chunk, x_chunk, acc00);
+        acc10 = _mm256_fmadd_ps(row1_chunk, x_chunk, acc10);
+        kk += 8;
+    }
+
+    let mut sum0 = unsafe { reduce_f32x8_x86(acc00) + reduce_f32x8_x86(acc01) };
+    let mut sum1 = unsafe { reduce_f32x8_x86(acc10) + reduce_f32x8_x86(acc11) };
+    while kk < k_dim {
+        let xv = x[kk];
+        sum0 += row0[kk].to_f32() * xv;
+        sum1 += row1[kk].to_f32() * xv;
+        kk += 1;
+    }
+    (sum0, sum1)
+}
+
+#[cfg(all(
+    feature = "x86-fp-kernels",
+    any(target_arch = "x86_64", target_arch = "x86")
+))]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot3_f32_bf16_x86_avx2(
+    x: &[f32],
+    row0: &[bf16],
+    row1: &[bf16],
+    row2: &[bf16],
+) -> (f32, f32, f32) {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let k_dim = x.len();
+    let mut kk = 0usize;
+    let mut acc00 = _mm256_setzero_ps();
+    let mut acc01 = _mm256_setzero_ps();
+    let mut acc10 = _mm256_setzero_ps();
+    let mut acc11 = _mm256_setzero_ps();
+    let mut acc20 = _mm256_setzero_ps();
+    let mut acc21 = _mm256_setzero_ps();
+
+    while kk + 16 <= k_dim {
+        let x_lo = unsafe { _mm256_loadu_ps(x.as_ptr().add(kk)) };
+        let x_hi = unsafe { _mm256_loadu_ps(x.as_ptr().add(kk + 8)) };
+        let row0_lo = unsafe { load_bf16_as_f32x8_x86(row0.as_ptr().add(kk)) };
+        let row0_hi = unsafe { load_bf16_as_f32x8_x86(row0.as_ptr().add(kk + 8)) };
+        let row1_lo = unsafe { load_bf16_as_f32x8_x86(row1.as_ptr().add(kk)) };
+        let row1_hi = unsafe { load_bf16_as_f32x8_x86(row1.as_ptr().add(kk + 8)) };
+        let row2_lo = unsafe { load_bf16_as_f32x8_x86(row2.as_ptr().add(kk)) };
+        let row2_hi = unsafe { load_bf16_as_f32x8_x86(row2.as_ptr().add(kk + 8)) };
+        acc00 = _mm256_fmadd_ps(row0_lo, x_lo, acc00);
+        acc01 = _mm256_fmadd_ps(row0_hi, x_hi, acc01);
+        acc10 = _mm256_fmadd_ps(row1_lo, x_lo, acc10);
+        acc11 = _mm256_fmadd_ps(row1_hi, x_hi, acc11);
+        acc20 = _mm256_fmadd_ps(row2_lo, x_lo, acc20);
+        acc21 = _mm256_fmadd_ps(row2_hi, x_hi, acc21);
+        kk += 16;
+    }
+
+    while kk + 8 <= k_dim {
+        let x_chunk = unsafe { _mm256_loadu_ps(x.as_ptr().add(kk)) };
+        let row0_chunk = unsafe { load_bf16_as_f32x8_x86(row0.as_ptr().add(kk)) };
+        let row1_chunk = unsafe { load_bf16_as_f32x8_x86(row1.as_ptr().add(kk)) };
+        let row2_chunk = unsafe { load_bf16_as_f32x8_x86(row2.as_ptr().add(kk)) };
+        acc00 = _mm256_fmadd_ps(row0_chunk, x_chunk, acc00);
+        acc10 = _mm256_fmadd_ps(row1_chunk, x_chunk, acc10);
+        acc20 = _mm256_fmadd_ps(row2_chunk, x_chunk, acc20);
+        kk += 8;
+    }
+
+    let mut sum0 = unsafe { reduce_f32x8_x86(acc00) + reduce_f32x8_x86(acc01) };
+    let mut sum1 = unsafe { reduce_f32x8_x86(acc10) + reduce_f32x8_x86(acc11) };
+    let mut sum2 = unsafe { reduce_f32x8_x86(acc20) + reduce_f32x8_x86(acc21) };
+    while kk < k_dim {
+        let xv = x[kk];
+        sum0 += row0[kk].to_f32() * xv;
+        sum1 += row1[kk].to_f32() * xv;
+        sum2 += row2[kk].to_f32() * xv;
+        kk += 1;
+    }
+    (sum0, sum1, sum2)
+}
+
+#[cfg(all(
+    feature = "x86-fp-kernels",
+    any(target_arch = "x86_64", target_arch = "x86")
+))]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn dot_f32_x86_avx2(x: &[f32], row: &[f32]) -> f32 {
     #[cfg(target_arch = "x86")]
@@ -816,16 +1227,83 @@ mod tests {
         let f16_sum = dot_f32_f16_arch(&x, &row_f16);
         let bf16_sum = dot_f32_bf16_arch(&x, &row_bf16);
 
-        if active_float_backend() == FloatKernelBackend::Arm64Neon {
-            if arch::arm64_fp16_kernel_runtime_available() {
-                assert!(f16_sum.is_some());
-            } else {
+        match active_float_backend() {
+            FloatKernelBackend::Portable => {
                 assert!(f16_sum.is_none());
+                assert!(bf16_sum.is_none());
             }
-            assert!(bf16_sum.is_some());
-        } else {
-            assert!(f16_sum.is_none());
-            assert!(bf16_sum.is_none());
+            FloatKernelBackend::Arm64Neon => {
+                if arch::arm64_fp16_kernel_runtime_available() {
+                    assert!(f16_sum.is_some());
+                } else {
+                    assert!(f16_sum.is_none());
+                }
+                assert!(bf16_sum.is_some());
+            }
+            FloatKernelBackend::X86Avx2 => {
+                if arch::x86_fp16_kernel_runtime_available() {
+                    assert!(f16_sum.is_some());
+                } else {
+                    assert!(f16_sum.is_none());
+                }
+                assert!(bf16_sum.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_precision_fast_paths_match_scalar_reference() {
+        let x = [
+            -1.25f32, 0.5, 2.0, -0.75, 1.5, -2.25, 3.0, 0.125, 1.75, -1.0, 0.625, 2.5, -3.5,
+            4.0, -0.875, 1.125, 0.333, -0.666, 1.999,
+        ];
+        let row0_f16 = x.map(|v| f16::from_f32(v * 0.75 + 0.125));
+        let row1_f16 = x.map(|v| f16::from_f32(v * -0.5 + 0.25));
+        let row2_f16 = x.map(|v| f16::from_f32(v * 1.25 - 0.75));
+        let row0_bf16 = x.map(|v| bf16::from_f32(v * 0.75 + 0.125));
+        let row1_bf16 = x.map(|v| bf16::from_f32(v * -0.5 + 0.25));
+        let row2_bf16 = x.map(|v| bf16::from_f32(v * 1.25 - 0.75));
+
+        let scalar_f16 = |row: &[f16]| -> f32 {
+            x.iter()
+                .zip(row.iter())
+                .map(|(&xv, &rv)| xv * rv.to_f32())
+                .sum()
+        };
+        let scalar_bf16 = |row: &[bf16]| -> f32 {
+            x.iter()
+                .zip(row.iter())
+                .map(|(&xv, &rv)| xv * rv.to_f32())
+                .sum()
+        };
+
+        if let Some(sum) = dot_f32_f16_arch(&x, &row0_f16) {
+            assert!((sum - scalar_f16(&row0_f16)).abs() <= 1e-3);
+        }
+        if let Some((sum0, sum1)) = dot2_f32_f16_arch(&x, &row0_f16, &row1_f16) {
+            assert!((sum0 - scalar_f16(&row0_f16)).abs() <= 1e-3);
+            assert!((sum1 - scalar_f16(&row1_f16)).abs() <= 1e-3);
+        }
+        if let Some((sum0, sum1, sum2)) = dot3_f32_f16_arch(&x, &row0_f16, &row1_f16, &row2_f16)
+        {
+            assert!((sum0 - scalar_f16(&row0_f16)).abs() <= 1e-3);
+            assert!((sum1 - scalar_f16(&row1_f16)).abs() <= 1e-3);
+            assert!((sum2 - scalar_f16(&row2_f16)).abs() <= 1e-3);
+        }
+
+        if let Some(sum) = dot_f32_bf16_arch(&x, &row0_bf16) {
+            assert!((sum - scalar_bf16(&row0_bf16)).abs() <= 1e-2);
+        }
+        if let Some((sum0, sum1)) = dot2_f32_bf16_arch(&x, &row0_bf16, &row1_bf16) {
+            assert!((sum0 - scalar_bf16(&row0_bf16)).abs() <= 1e-2);
+            assert!((sum1 - scalar_bf16(&row1_bf16)).abs() <= 1e-2);
+        }
+        if let Some((sum0, sum1, sum2)) =
+            dot3_f32_bf16_arch(&x, &row0_bf16, &row1_bf16, &row2_bf16)
+        {
+            assert!((sum0 - scalar_bf16(&row0_bf16)).abs() <= 1e-2);
+            assert!((sum1 - scalar_bf16(&row1_bf16)).abs() <= 1e-2);
+            assert!((sum2 - scalar_bf16(&row2_bf16)).abs() <= 1e-2);
         }
     }
 

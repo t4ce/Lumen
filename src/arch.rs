@@ -90,6 +90,24 @@ pub fn x86_fp_kernel_runtime_available() -> bool {
 }
 
 #[inline]
+pub fn x86_fp16_kernel_runtime_available() -> bool {
+    #[cfg(all(
+        feature = "x86-fp-kernels",
+        any(target_arch = "x86_64", target_arch = "x86")
+    ))]
+    {
+        x86_fp_kernel_runtime_available() && std::arch::is_x86_feature_detected!("f16c")
+    }
+    #[cfg(not(all(
+        feature = "x86-fp-kernels",
+        any(target_arch = "x86_64", target_arch = "x86")
+    )))]
+    {
+        false
+    }
+}
+
+#[inline]
 pub fn x86_i8_kernel_runtime_available() -> bool {
     #[cfg(all(
         feature = "x86-int8-kernels",
@@ -168,5 +186,10 @@ mod tests {
     #[test]
     fn arm64_fp16_probe_is_never_broader_than_fp_backend_probe() {
         assert!(!arm64_fp16_kernel_runtime_available() || arm64_fp_kernel_runtime_available());
+    }
+
+    #[test]
+    fn x86_fp16_probe_is_never_broader_than_fp_backend_probe() {
+        assert!(!x86_fp16_kernel_runtime_available() || x86_fp_kernel_runtime_available());
     }
 }

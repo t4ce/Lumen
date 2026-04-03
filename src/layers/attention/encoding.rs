@@ -1,4 +1,6 @@
-use crate::autograd::{StoragePreference, Tensor, TensorData, TensorStorageView, is_no_grad};
+use crate::autograd::{
+    StoragePreference, Tensor, TensorData, TensorStorageOwned, TensorStorageView, is_no_grad,
+};
 use crate::precision::{DType, default_activation_dtype};
 use half::{bf16, f16};
 use ndarray::{Array, ArrayD, Ix2, Zip, s};
@@ -20,16 +22,21 @@ impl RotaryEmbedding {
     }
 
     pub fn new_with_dtype(dim: usize, max_seq_len: usize, theta: f32, dtype: DType) -> Self {
+        let cache_dtype = if dtype == DType::I8 {
+            DType::F32
+        } else {
+            dtype
+        };
         assert!(
-            dtype.is_float(),
+            cache_dtype.is_float(),
             "RotaryEmbedding cache currently only supports floating runtime dtypes, got {:?}",
             dtype
         );
         let (cos, sin) = Self::precompute_freqs_cis(dim, max_seq_len, theta);
         let cos_cache = Tensor::from_array_no_grad(cos);
         let sin_cache = Tensor::from_array_no_grad(sin);
-        cos_cache.cast_inplace(dtype);
-        sin_cache.cast_inplace(dtype);
+        cos_cache.cast_inplace(cache_dtype);
+        sin_cache.cast_inplace(cache_dtype);
 
         Self {
             dim,
@@ -75,6 +82,106 @@ impl RotaryEmbedding {
         let build_graph = !is_no_grad() && x.requires_grad();
 
         if !build_graph {
+            if x.dtype() == DType::I8 {
+                return match x.native_storage_owned() {
+                    TensorStorageOwned::I8(x_data, x_scale) => {
+                        let shape = x_data.shape().to_vec();
+                        assert_eq!(shape.len(), 4, "RoPE expects input [B,H,S,D]");
+                        let (_b, _h, seq_len, d) = (shape[0], shape[1], shape[2], shape[3]);
+                        assert_eq!(d, self.dim, "RoPE dimension mismatch");
+                        let end = offset + seq_len;
+                        if end > self.max_seq_len {
+                            panic!(
+                                "RoPE index out of range: offset {} + len {} > max {}",
+                                offset, seq_len, self.max_seq_len
+                            );
+                        }
+
+                        self.cos_cache.with_storage_view_preferring(
+                            StoragePreference::F32Compute,
+                            |cos_view| {
+                                self.sin_cache.with_storage_view_preferring(
+                                    StoragePreference::F32Compute,
+                                    |sin_view| {
+                                        let cos_4d = match cos_view {
+                                            TensorStorageView::F32(view) => view
+                                                .into_dimensionality::<ndarray::Ix4>()
+                                                .expect("RoPE Cache dimensionality mismatch"),
+                                            TensorStorageView::F16(_) => unreachable!(
+                                                "f32 compute preference should expose f32 view"
+                                            ),
+                                            TensorStorageView::BF16(_) => unreachable!(
+                                                "f32 compute preference should expose f32 view"
+                                            ),
+                                        };
+                                        let sin_4d = match sin_view {
+                                            TensorStorageView::F32(view) => view
+                                                .into_dimensionality::<ndarray::Ix4>()
+                                                .expect("RoPE Cache dimensionality mismatch"),
+                                            TensorStorageView::F16(_) => unreachable!(
+                                                "f32 compute preference should expose f32 view"
+                                            ),
+                                            TensorStorageView::BF16(_) => unreachable!(
+                                                "f32 compute preference should expose f32 view"
+                                            ),
+                                        };
+                                        let cos_slice_2d = cos_4d
+                                            .slice(s![0, 0, offset..end, ..])
+                                            .into_dimensionality::<Ix2>()
+                                            .expect("RoPE Cache dimensionality mismatch");
+                                        let sin_slice_2d = sin_4d
+                                            .slice(s![0, 0, offset..end, ..])
+                                            .into_dimensionality::<Ix2>()
+                                            .expect("RoPE Cache dimensionality mismatch");
+
+                                        let x_view = x_data
+                                            .view()
+                                            .into_dimensionality::<ndarray::Ix4>()
+                                            .unwrap();
+                                        let mut out = Array::zeros(x_data.raw_dim());
+                                        let mut out_view = out
+                                            .view_mut()
+                                            .into_dimensionality::<ndarray::Ix4>()
+                                            .unwrap();
+
+                                        Zip::from(out_view.outer_iter_mut())
+                                            .and(x_view.outer_iter())
+                                            .par_for_each(|mut out_b, x_b| {
+                                                Zip::from(out_b.outer_iter_mut())
+                                                    .and(x_b.outer_iter())
+                                                    .for_each(|mut out_h, x_h| {
+                                                        let half = d / 2;
+                                                        for ss in 0..seq_len {
+                                                            for j in 0..half {
+                                                                let x1 =
+                                                                    x_h[[ss, j]] as f32 * x_scale;
+                                                                let x2 = x_h[[ss, j + half]] as f32
+                                                                    * x_scale;
+                                                                let c = cos_slice_2d[[ss, j]];
+                                                                let s_val = sin_slice_2d[[ss, j]];
+                                                                out_h[[ss, j]] =
+                                                                    x1 * c - x2 * s_val;
+                                                                out_h[[ss, j + half]] =
+                                                                    x2 * c + x1 * s_val;
+                                                            }
+                                                        }
+                                                    });
+                                            });
+
+                                        let out = Tensor::from_array_no_grad(out.into_dyn());
+                                        out.cast_inplace(DType::I8);
+                                        out
+                                    },
+                                )
+                            },
+                        )
+                    }
+                    TensorStorageOwned::F32(_)
+                    | TensorStorageOwned::F16(_)
+                    | TensorStorageOwned::BF16(_) => unreachable!("checked i8 input above"),
+                };
+            }
+
             return x.with_storage_view_preferring(StoragePreference::Native, |x_view| {
                 let shape = match &x_view {
                     TensorStorageView::F32(x_view) => x_view.shape().to_vec(),
@@ -586,5 +693,18 @@ mod tests {
                 assert_eq!(rope.sin_cache.dtype(), DType::F32);
             },
         );
+    }
+
+    #[test]
+    fn rope_no_grad_preserves_i8_input_dtype() {
+        let rope = RotaryEmbedding::new(4, 8, 10000.0);
+        let input_i8 = make_tensor(
+            &[1, 1, 2, 4],
+            vec![1.0, 2.0, 3.0, 4.0, -1.0, 0.5, 2.5, -3.0],
+            DType::I8,
+        );
+
+        let out = no_grad(|| rope.forward(&input_i8, 0));
+        assert_eq!(out.dtype(), DType::I8);
     }
 }

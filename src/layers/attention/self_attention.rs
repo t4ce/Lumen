@@ -378,11 +378,6 @@ impl SelfAttention {
             "n_head must be divisible by n_kv_head"
         );
         assert!(
-            activation_dtype.is_float(),
-            "SelfAttention activation dtype currently only supports floating types, got {:?}",
-            activation_dtype
-        );
-        assert!(
             kv_cache_dtype.is_float(),
             "SelfAttention KV cache dtype currently only supports floating types, got {:?}",
             kv_cache_dtype
@@ -483,11 +478,6 @@ impl SelfAttention {
 
         let activation_dtype = default_activation_dtype();
         let kv_cache_dtype = default_kv_cache_dtype();
-        assert!(
-            activation_dtype.is_float(),
-            "SelfAttention activation dtype currently only supports floating types, got {:?}",
-            activation_dtype
-        );
         assert!(
             kv_cache_dtype.is_float(),
             "SelfAttention KV cache dtype currently only supports floating types, got {:?}",
@@ -1320,6 +1310,23 @@ mod tests {
                 );
             },
         );
+    }
+
+    #[test]
+    fn self_attention_allows_i8_activation_dtype_with_float_kv_cache() {
+        let attn = SelfAttention::new_with_runtime_dtypes(
+            8,
+            2,
+            1,
+            8,
+            10000.0,
+            true,
+            DType::I8,
+            DType::I8,
+            DType::BF16,
+        );
+        assert_eq!(attn.activation_dtype(), DType::I8);
+        assert_eq!(attn.kv_cache_dtype(), DType::BF16);
     }
 
     #[test]

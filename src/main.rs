@@ -46,7 +46,7 @@ struct Args {
 
 fn usage(program: &str) {
     eprintln!(
-        "Usage:\n  {program} --weights PATH --tokenizer PATH [options]\n\nOptions:\n  --system TEXT              System prompt\n  --temperature FLOAT        Sampling temperature (default: 0.8)\n  --top-p FLOAT              Top-p nucleus sampling (default: 0.9)\n  --repetition-penalty FLOAT Repetition penalty (default: 1.05)\n  --recent-window N          Recent token window for repetition penalty (default: 96)\n  --max-gen N                Max generated tokens per turn (default: 200)\n  --parameter-dtype DTYPE    Default parameter dtype: f32/f16/bf16/i8 (default: f32)\n  --runtime-dtype DTYPE      Legacy shared default for activation/KV cache dtype: f32/f16/bf16 (default: f32)\n  --activation-dtype DTYPE   Activation/hidden dtype override: f32/f16/bf16\n  --kv-cache-dtype DTYPE     KV cache dtype override: f32/f16/bf16\n  --quantize DTYPE           Quantize float weights on load: off/i8 (default: off)\n  --quant-scale FLOAT        Manual quantization scale override\n  --allow-parameter-copies   Allow cached parameter dtype copies\n  --stream-weights           Stream weights from disk instead of memory-mapping whole safetensors\n  --max-seq-len N            Override KV cache max sequence length (default: 2048)\n  --load-only                Load model and initialize KV cache, then exit\n\nCommands in chat:\n  /reset   Clear history and KV cache\n  /exit    Quit"
+        "Usage:\n  {program} --weights PATH --tokenizer PATH [options]\n\nOptions:\n  --system TEXT              System prompt\n  --temperature FLOAT        Sampling temperature (default: 0.8)\n  --top-p FLOAT              Top-p nucleus sampling (default: 0.9)\n  --repetition-penalty FLOAT Repetition penalty (default: 1.05)\n  --recent-window N          Recent token window for repetition penalty (default: 96)\n  --max-gen N                Max generated tokens per turn (default: 200)\n  --parameter-dtype DTYPE    Default parameter dtype: f32/f16/bf16/i8 (default: f32)\n  --runtime-dtype DTYPE      Legacy shared default for activation/KV cache dtype: f32/f16/bf16 (default: f32)\n  --activation-dtype DTYPE   Activation/hidden dtype override: f32/f16/bf16/i8\n  --kv-cache-dtype DTYPE     KV cache dtype override: f32/f16/bf16\n  --quantize DTYPE           Quantize float weights on load: off/i8 (default: off)\n  --quant-scale FLOAT        Manual quantization scale override\n  --allow-parameter-copies   Allow cached parameter dtype copies\n  --stream-weights           Stream weights from disk instead of memory-mapping whole safetensors\n  --max-seq-len N            Override KV cache max sequence length (default: 2048)\n  --load-only                Load model and initialize KV cache, then exit\n\nCommands in chat:\n  /reset   Clear history and KV cache\n  /exit    Quit"
     );
 }
 
@@ -193,7 +193,7 @@ fn parse_args() -> Result<Args, String> {
                 activation_dtype = Some(parse_dtype_flag(
                     "--activation-dtype",
                     argv.get(i).ok_or("--activation-dtype 缺少 dtype")?,
-                    false,
+                    true,
                 )?);
             }
             "--kv-cache-dtype" => {

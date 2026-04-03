@@ -1,4 +1,6 @@
-use crate::autograd::{StoragePreference, Tensor, TensorData, TensorStorageView, is_no_grad};
+use crate::autograd::{
+    StoragePreference, Tensor, TensorData, TensorStorageOwned, TensorStorageView, is_no_grad,
+};
 use crate::module::Module;
 use crate::precision::DType;
 use half::{bf16, f16};
@@ -35,6 +37,111 @@ impl Module for RMSNorm {
         let build_graph = !is_no_grad() && (input.requires_grad() || self.weight.requires_grad());
 
         if !build_graph {
+            if input.dtype() == DType::I8 {
+                return match input.native_storage_owned() {
+                    TensorStorageOwned::I8(input_data, input_scale) => {
+                        self.weight.with_storage_view_preferring(
+                            StoragePreference::F32Compute,
+                            |weight_view| {
+                                let shape = input_data.shape().to_vec();
+                                let dim = shape[shape.len() - 1];
+                                let rows = shape.iter().product::<usize>() / dim;
+                                let eps = self.eps;
+                                let x_cow = input_data.view().to_owned();
+                                let x_2d = x_cow.view().into_shape((rows, dim)).unwrap();
+                                let mut output_flat = Array2::<f32>::zeros((rows, dim));
+
+                                match weight_view {
+                                    TensorStorageView::F32(weight_view) => {
+                                        let w_1d = weight_view
+                                            .into_dimensionality::<ndarray::Ix1>()
+                                            .expect("RMSNorm weight must be 1D");
+                                        let w_slice = w_1d
+                                            .as_slice()
+                                            .expect("RMSNorm weight should be contiguous");
+
+                                        Zip::from(output_flat.outer_iter_mut())
+                                            .and(x_2d.outer_iter())
+                                            .par_for_each(|mut out_row, x_row| {
+                                                let sum_sq = x_row.fold(0.0f32, |acc, &val| {
+                                                    let v = val as f32 * input_scale;
+                                                    acc + v * v
+                                                });
+                                                let rms = (sum_sq / dim as f32 + eps).sqrt();
+                                                let inv_rms = 1.0 / rms;
+
+                                                for (o, (&xi, &wi)) in out_row
+                                                    .iter_mut()
+                                                    .zip(x_row.iter().zip(w_slice))
+                                                {
+                                                    *o = (xi as f32 * input_scale) * inv_rms * wi;
+                                                }
+                                            });
+                                    }
+                                    TensorStorageView::F16(weight_view) => {
+                                        let w_1d = weight_view
+                                            .into_dimensionality::<ndarray::Ix1>()
+                                            .expect("RMSNorm weight must be 1D");
+                                        Zip::from(output_flat.outer_iter_mut())
+                                            .and(x_2d.outer_iter())
+                                            .par_for_each(|mut out_row, x_row| {
+                                                let sum_sq = x_row.fold(0.0f32, |acc, &val| {
+                                                    let v = val as f32 * input_scale;
+                                                    acc + v * v
+                                                });
+                                                let rms = (sum_sq / dim as f32 + eps).sqrt();
+                                                let inv_rms = 1.0 / rms;
+
+                                                for (o, (&xi, &wi)) in out_row
+                                                    .iter_mut()
+                                                    .zip(x_row.iter().zip(w_1d.iter()))
+                                                {
+                                                    *o = (xi as f32 * input_scale)
+                                                        * inv_rms
+                                                        * wi.to_f32();
+                                                }
+                                            });
+                                    }
+                                    TensorStorageView::BF16(weight_view) => {
+                                        let w_1d = weight_view
+                                            .into_dimensionality::<ndarray::Ix1>()
+                                            .expect("RMSNorm weight must be 1D");
+                                        Zip::from(output_flat.outer_iter_mut())
+                                            .and(x_2d.outer_iter())
+                                            .par_for_each(|mut out_row, x_row| {
+                                                let sum_sq = x_row.fold(0.0f32, |acc, &val| {
+                                                    let v = val as f32 * input_scale;
+                                                    acc + v * v
+                                                });
+                                                let rms = (sum_sq / dim as f32 + eps).sqrt();
+                                                let inv_rms = 1.0 / rms;
+
+                                                for (o, (&xi, &wi)) in out_row
+                                                    .iter_mut()
+                                                    .zip(x_row.iter().zip(w_1d.iter()))
+                                                {
+                                                    *o = (xi as f32 * input_scale)
+                                                        * inv_rms
+                                                        * wi.to_f32();
+                                                }
+                                            });
+                                    }
+                                }
+
+                                let out = Tensor::from_array_no_grad(
+                                    output_flat.into_shape(shape).unwrap().into_dyn(),
+                                );
+                                out.cast_inplace(DType::I8);
+                                out
+                            },
+                        )
+                    }
+                    TensorStorageOwned::F32(_)
+                    | TensorStorageOwned::F16(_)
+                    | TensorStorageOwned::BF16(_) => unreachable!("checked i8 input above"),
+                };
+            }
+
             return input.with_storage_view_preferring(StoragePreference::Native, |input_view| {
                 self.weight.with_storage_view(|weight_view| {
                     let shape = match &input_view {
@@ -555,5 +662,20 @@ mod tests {
                 assert_eq!(norm.weight.dtype(), DType::F32);
             },
         );
+    }
+
+    #[test]
+    fn rms_norm_no_grad_preserves_i8_input_dtype() {
+        let norm = RMSNorm::new(4, 1e-5);
+        norm.weight.set_array_f32_with_dtype(
+            Array::from_shape_vec(IxDyn(&[4]), vec![1.0, 0.5, 1.5, 2.0])
+                .expect("weight shape mismatch")
+                .into_dyn(),
+            DType::BF16,
+        );
+
+        let input_i8 = make_tensor(&[1, 1, 4], vec![1.0, -2.0, 3.0, -4.0], DType::I8);
+        let out = no_grad(|| norm.forward(input_i8));
+        assert_eq!(out.dtype(), DType::I8);
     }
 }

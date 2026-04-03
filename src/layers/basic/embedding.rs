@@ -1,4 +1,6 @@
-use crate::autograd::{StoragePreference, Tensor, TensorData, TensorStorageView, is_no_grad};
+use crate::autograd::{
+    StoragePreference, Tensor, TensorData, TensorStorageOwned, TensorStorageView, is_no_grad,
+};
 use crate::init::{InitType, tensor_init, tensor_init_with_dtype};
 use crate::module::Module;
 use crate::precision::DType;
@@ -93,6 +95,32 @@ impl Embedding {
         });
 
         if !build_graph {
+            if self.weight.dtype() == DType::I8 {
+                return match self.weight.native_storage_owned() {
+                    TensorStorageOwned::I8(w_data, scale) => {
+                        let mut out = ndarray::ArrayD::<i8>::zeros(ndarray::IxDyn(&out_shape));
+                        let mut out_flat = out
+                            .view_mut()
+                            .into_shape((num_elements, e_dim))
+                            .expect("Flatten output failed");
+                        let w_2d = w_data
+                            .view()
+                            .into_dimensionality::<ndarray::Ix2>()
+                            .expect("Embedding weight must be 2D");
+                        Zip::from(out_flat.outer_iter_mut())
+                            .and(&idx_values)
+                            .par_for_each(|mut out_row, &idx| {
+                                let w_row = w_2d.slice(ndarray::s![idx, ..]);
+                                out_row.assign(&w_row);
+                            });
+                        Tensor::from_i8_data_no_grad(out.into_shared(), scale)
+                    }
+                    TensorStorageOwned::F32(_)
+                    | TensorStorageOwned::F16(_)
+                    | TensorStorageOwned::BF16(_) => unreachable!("checked i8 weight above"),
+                };
+            }
+
             return self
                 .weight
                 .with_storage_view_preferring(StoragePreference::Native, |w_view| match w_view {
@@ -328,6 +356,38 @@ mod tests {
                 panic!("bf16 embedding output should stay bf16 in no-grad")
             }
         });
+    }
+
+    #[test]
+    fn embedding_no_grad_preserves_i8_weight_dtype() {
+        let emb = Embedding::new(4, 2);
+        emb.weight.set_array_f32_with_dtype(
+            Array::from_shape_vec(IxDyn(&[4, 2]), vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0])
+                .expect("weight shape mismatch")
+                .into_dyn(),
+            DType::I8,
+        );
+        let indices = make_tensor(&[1, 2], vec![1.0, 3.0], DType::F32);
+
+        let out = no_grad(|| emb.forward(&indices));
+        assert_eq!(out.dtype(), DType::I8);
+        let ref_vals = no_grad(|| {
+            let ref_emb = Embedding::new(4, 2);
+            ref_emb.weight.set_array_f32_with_dtype(
+                Array::from_shape_vec(IxDyn(&[4, 2]), vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0])
+                    .expect("weight shape mismatch")
+                    .into_dyn(),
+                DType::I8,
+            );
+            ref_emb
+                .forward(&indices)
+                .data_ref()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>()
+        });
+        let out_vals = out.data_ref().iter().copied().collect::<Vec<_>>();
+        assert_eq!(out_vals, ref_vals);
     }
 
     #[test]
