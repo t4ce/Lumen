@@ -72,6 +72,44 @@ pub fn arm64_fp16_kernel_runtime_available() -> bool {
 }
 
 #[inline]
+pub fn x86_avx512_fp_kernel_runtime_available() -> bool {
+    #[cfg(all(
+        feature = "x86-fp-kernels",
+        any(target_arch = "x86_64", target_arch = "x86")
+    ))]
+    {
+        std::arch::is_x86_feature_detected!("avx512f")
+    }
+    #[cfg(not(all(
+        feature = "x86-fp-kernels",
+        any(target_arch = "x86_64", target_arch = "x86")
+    )))]
+    {
+        false
+    }
+}
+
+#[inline]
+pub fn x86_avx512_bf16_kernel_runtime_available() -> bool {
+    #[cfg(all(
+        feature = "x86-fp-kernels",
+        any(target_arch = "x86_64", target_arch = "x86")
+    ))]
+    {
+        x86_avx512_fp_kernel_runtime_available()
+            && std::arch::is_x86_feature_detected!("avx512vl")
+            && std::arch::is_x86_feature_detected!("avx512bf16")
+    }
+    #[cfg(not(all(
+        feature = "x86-fp-kernels",
+        any(target_arch = "x86_64", target_arch = "x86")
+    )))]
+    {
+        false
+    }
+}
+
+#[inline]
 pub fn x86_fp_kernel_runtime_available() -> bool {
     #[cfg(all(
         feature = "x86-fp-kernels",
@@ -96,7 +134,8 @@ pub fn x86_fp16_kernel_runtime_available() -> bool {
         any(target_arch = "x86_64", target_arch = "x86")
     ))]
     {
-        x86_fp_kernel_runtime_available() && std::arch::is_x86_feature_detected!("f16c")
+        x86_avx512_fp_kernel_runtime_available()
+            || (x86_fp_kernel_runtime_available() && std::arch::is_x86_feature_detected!("f16c"))
     }
     #[cfg(not(all(
         feature = "x86-fp-kernels",
@@ -140,6 +179,8 @@ pub fn preferred_i8_kernel_backend() -> &'static str {
 pub fn preferred_fp_kernel_backend() -> &'static str {
     if arm64_fp_kernel_runtime_available() {
         "arm64-neon"
+    } else if x86_avx512_fp_kernel_runtime_available() {
+        "x86-avx512"
     } else if x86_fp_kernel_runtime_available() {
         "x86-avx2"
     } else {
@@ -176,6 +217,8 @@ mod tests {
         let backend = preferred_fp_kernel_backend();
         if arm64_fp_kernel_runtime_available() {
             assert_eq!(backend, "arm64-neon");
+        } else if x86_avx512_fp_kernel_runtime_available() {
+            assert_eq!(backend, "x86-avx512");
         } else if x86_fp_kernel_runtime_available() {
             assert_eq!(backend, "x86-avx2");
         } else {
