@@ -1,7 +1,7 @@
 use half::{bf16, f16};
 use lumen::autograd::{Tensor, no_grad};
-use lumen::ops::fused::{fused_gate_up_silu_infer_into, fused_qkv_decode_infer_into};
 use lumen::ops::fp_kernels::active_float_backend_name;
+use lumen::ops::fused::{fused_gate_up_silu_infer_into, fused_qkv_decode_infer_into};
 use lumen::ops::int8_kernels::active_int8_backend_name;
 use lumen::ops::matmul::{
     SliceRef, dual_matvec_rowmajor_parallel, dual_matvec_rowmajor_parallel_mixed,

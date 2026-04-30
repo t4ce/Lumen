@@ -123,7 +123,9 @@ pub fn dot3_f32_arch(
             feature = "x86-fp-kernels",
             any(target_arch = "x86_64", target_arch = "x86")
         ))]
-        FloatKernelBackend::X86Avx512 => Some(unsafe { dot3_f32_x86_avx512(_x, _row0, _row1, _row2) }),
+        FloatKernelBackend::X86Avx512 => {
+            Some(unsafe { dot3_f32_x86_avx512(_x, _row0, _row1, _row2) })
+        }
         #[cfg(all(
             feature = "x86-fp-kernels",
             any(target_arch = "x86_64", target_arch = "x86")
@@ -208,7 +210,9 @@ pub fn dot3_f32_f16_arch(
             feature = "x86-fp-kernels",
             any(target_arch = "x86_64", target_arch = "x86")
         ))]
-        FloatKernelBackend::X86Avx512 => Some(unsafe { dot3_f32_f16_x86_avx512(_x, _row0, _row1, _row2) }),
+        FloatKernelBackend::X86Avx512 => {
+            Some(unsafe { dot3_f32_f16_x86_avx512(_x, _row0, _row1, _row2) })
+        }
         #[cfg(all(
             feature = "x86-fp-kernels",
             any(target_arch = "x86_64", target_arch = "x86")
@@ -234,11 +238,13 @@ pub fn dot_f32_bf16_arch(_x: &[f32], _row: &[bf16]) -> Option<f32> {
             feature = "x86-fp-kernels",
             any(target_arch = "x86_64", target_arch = "x86")
         ))]
-        FloatKernelBackend::X86Avx512 => Some(if arch::x86_avx512_bf16_kernel_runtime_available() {
-            unsafe { dot_f32_bf16_x86_avx512(_x, _row) }
-        } else {
-            unsafe { dot_f32_bf16_x86_avx2(_x, _row) }
-        }),
+        FloatKernelBackend::X86Avx512 => {
+            Some(if arch::x86_avx512_bf16_kernel_runtime_available() {
+                unsafe { dot_f32_bf16_x86_avx512(_x, _row) }
+            } else {
+                unsafe { dot_f32_bf16_x86_avx2(_x, _row) }
+            })
+        }
         #[cfg(all(
             feature = "x86-fp-kernels",
             any(target_arch = "x86_64", target_arch = "x86")
@@ -265,11 +271,13 @@ pub fn dot2_f32_bf16_arch(_x: &[f32], _row0: &[bf16], _row1: &[bf16]) -> Option<
             feature = "x86-fp-kernels",
             any(target_arch = "x86_64", target_arch = "x86")
         ))]
-        FloatKernelBackend::X86Avx512 => Some(if arch::x86_avx512_bf16_kernel_runtime_available() {
-            unsafe { dot2_f32_bf16_x86_avx512(_x, _row0, _row1) }
-        } else {
-            unsafe { dot2_f32_bf16_x86_avx2(_x, _row0, _row1) }
-        }),
+        FloatKernelBackend::X86Avx512 => {
+            Some(if arch::x86_avx512_bf16_kernel_runtime_available() {
+                unsafe { dot2_f32_bf16_x86_avx512(_x, _row0, _row1) }
+            } else {
+                unsafe { dot2_f32_bf16_x86_avx2(_x, _row0, _row1) }
+            })
+        }
         #[cfg(all(
             feature = "x86-fp-kernels",
             any(target_arch = "x86_64", target_arch = "x86")
@@ -301,16 +309,20 @@ pub fn dot3_f32_bf16_arch(
             feature = "x86-fp-kernels",
             any(target_arch = "x86_64", target_arch = "x86")
         ))]
-        FloatKernelBackend::X86Avx512 => Some(if arch::x86_avx512_bf16_kernel_runtime_available() {
-            unsafe { dot3_f32_bf16_x86_avx512(_x, _row0, _row1, _row2) }
-        } else {
-            unsafe { dot3_f32_bf16_x86_avx2(_x, _row0, _row1, _row2) }
-        }),
+        FloatKernelBackend::X86Avx512 => {
+            Some(if arch::x86_avx512_bf16_kernel_runtime_available() {
+                unsafe { dot3_f32_bf16_x86_avx512(_x, _row0, _row1, _row2) }
+            } else {
+                unsafe { dot3_f32_bf16_x86_avx2(_x, _row0, _row1, _row2) }
+            })
+        }
         #[cfg(all(
             feature = "x86-fp-kernels",
             any(target_arch = "x86_64", target_arch = "x86")
         ))]
-        FloatKernelBackend::X86Avx2 => Some(unsafe { dot3_f32_bf16_x86_avx2(_x, _row0, _row1, _row2) }),
+        FloatKernelBackend::X86Avx2 => {
+            Some(unsafe { dot3_f32_bf16_x86_avx2(_x, _row0, _row1, _row2) })
+        }
         #[allow(unreachable_patterns)]
         _ => None,
     }
@@ -1870,8 +1882,8 @@ mod tests {
     #[test]
     fn mixed_precision_fast_paths_match_scalar_reference() {
         let x = [
-            -1.25f32, 0.5, 2.0, -0.75, 1.5, -2.25, 3.0, 0.125, 1.75, -1.0, 0.625, 2.5, -3.5,
-            4.0, -0.875, 1.125, 0.333, -0.666, 1.999,
+            -1.25f32, 0.5, 2.0, -0.75, 1.5, -2.25, 3.0, 0.125, 1.75, -1.0, 0.625, 2.5, -3.5, 4.0,
+            -0.875, 1.125, 0.333, -0.666, 1.999,
         ];
         let row0_f16 = x.map(|v| f16::from_f32(v * 0.75 + 0.125));
         let row1_f16 = x.map(|v| f16::from_f32(v * -0.5 + 0.25));
@@ -1900,8 +1912,7 @@ mod tests {
             assert!((sum0 - scalar_f16(&row0_f16)).abs() <= 1e-3);
             assert!((sum1 - scalar_f16(&row1_f16)).abs() <= 1e-3);
         }
-        if let Some((sum0, sum1, sum2)) = dot3_f32_f16_arch(&x, &row0_f16, &row1_f16, &row2_f16)
-        {
+        if let Some((sum0, sum1, sum2)) = dot3_f32_f16_arch(&x, &row0_f16, &row1_f16, &row2_f16) {
             assert!((sum0 - scalar_f16(&row0_f16)).abs() <= 1e-3);
             assert!((sum1 - scalar_f16(&row1_f16)).abs() <= 1e-3);
             assert!((sum2 - scalar_f16(&row2_f16)).abs() <= 1e-3);
@@ -1914,8 +1925,7 @@ mod tests {
             assert!((sum0 - scalar_bf16(&row0_bf16)).abs() <= 1e-2);
             assert!((sum1 - scalar_bf16(&row1_bf16)).abs() <= 1e-2);
         }
-        if let Some((sum0, sum1, sum2)) =
-            dot3_f32_bf16_arch(&x, &row0_bf16, &row1_bf16, &row2_bf16)
+        if let Some((sum0, sum1, sum2)) = dot3_f32_bf16_arch(&x, &row0_bf16, &row1_bf16, &row2_bf16)
         {
             assert!((sum0 - scalar_bf16(&row0_bf16)).abs() <= 1e-2);
             assert!((sum1 - scalar_bf16(&row1_bf16)).abs() <= 1e-2);

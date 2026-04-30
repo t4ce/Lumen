@@ -6,7 +6,6 @@ pub mod precision;
 #[macro_use]
 pub mod module;
 pub mod init;
-pub mod kv_cache;
 pub mod layers;
 pub mod loader;
 pub mod loss;

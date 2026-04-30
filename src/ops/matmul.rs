@@ -1,7 +1,8 @@
 use crate::autograd::{
     KernelRouteClass, StoragePreference, Tensor, TensorData, TensorStorageOwned, TensorStorageView,
-    is_no_grad,
+    assert_native_device_support, assert_same_device, is_no_grad, is_strict_device_execution,
 };
+use crate::ops::cuda;
 use crate::ops::fp_kernels::{
     dot_f32_arch, dot_f32_bf16_arch, dot_f32_f16_arch, dot2_f32_arch, dot2_f32_bf16_arch,
     dot2_f32_f16_arch, dot3_f32_arch, dot3_f32_bf16_arch, dot3_f32_f16_arch,
@@ -38,16 +39,6 @@ const QKV_I8_PAR_CHUNK_ROWS: usize = 64;
 const QKV_I8_PAR_CHUNK_ROWS: usize = 64;
 
 #[cfg(all(feature = "arm64-fp-kernels", target_arch = "aarch64"))]
-const MATVEC_MIXED_PAR_CHUNK_ROWS: usize = 64;
-#[cfg(not(all(feature = "arm64-fp-kernels", target_arch = "aarch64")))]
-const MATVEC_MIXED_PAR_CHUNK_ROWS: usize = 64;
-
-#[cfg(all(feature = "arm64-fp-kernels", target_arch = "aarch64"))]
-const QKV_MIXED_PAR_CHUNK_ROWS: usize = 64;
-#[cfg(not(all(feature = "arm64-fp-kernels", target_arch = "aarch64")))]
-const QKV_MIXED_PAR_CHUNK_ROWS: usize = 64;
-
-#[cfg(all(feature = "arm64-fp-kernels", target_arch = "aarch64"))]
 const MIXED_ROW_PAR_CHUNK_ROWS: usize = 32;
 #[cfg(not(all(feature = "arm64-fp-kernels", target_arch = "aarch64")))]
 const MIXED_ROW_PAR_CHUNK_ROWS: usize = 16;
@@ -57,21 +48,6 @@ const MATVEC_BLOCK_THRESHOLD: usize = 16384;
 const MATVEC_PAR_THRESHOLD: usize = 1024;
 #[cfg(not(all(feature = "arm64-int8-kernels", target_arch = "aarch64")))]
 const MATVEC_PAR_THRESHOLD: usize = 256;
-
-#[inline]
-fn should_use_mixed_silu_block_kernel(n_rows: usize) -> bool {
-    #[cfg(all(feature = "arm64-fp-kernels", target_arch = "aarch64"))]
-    {
-        let _ = n_rows;
-        false
-    }
-
-    #[cfg(not(all(feature = "arm64-fp-kernels", target_arch = "aarch64")))]
-    {
-        let _ = n_rows;
-        false
-    }
-}
 
 #[inline]
 fn should_use_mixed_matvec_block_kernel(n_rows: usize) -> bool {
@@ -1407,14 +1383,8 @@ pub fn matvec_rowmajor_parallel_i8_i8(
                         let row1_idx = row0_idx + 1;
                         let row0 = &w_rowmajor[row0_idx * k_dim..(row0_idx + 1) * k_dim];
                         let row1 = &w_rowmajor[row1_idx * k_dim..(row1_idx + 1) * k_dim];
-                        let (s0, s1) = dot2_unrolled_i8_i8(
-                            x,
-                            x_scale,
-                            row0,
-                            w_scale,
-                            row1,
-                            w_scale,
-                        );
+                        let (s0, s1) =
+                            dot2_unrolled_i8_i8(x, x_scale, row0, w_scale, row1, w_scale);
                         out_chunk[offset] = s0;
                         out_chunk[offset + 1] = s1;
                         offset += 2;
@@ -2685,10 +2655,8 @@ pub(crate) fn dual_matvec_rowmajor_parallel_f32_bf16(
             .enumerate()
             .for_each(|(chunk_idx, (out0_chunk, out1_chunk))| {
                 let row_start = chunk_idx * MIXED_ROW_PAR_CHUNK_ROWS;
-                for (offset, (dst0, dst1)) in out0_chunk
-                    .iter_mut()
-                    .zip(out1_chunk.iter_mut())
-                    .enumerate()
+                for (offset, (dst0, dst1)) in
+                    out0_chunk.iter_mut().zip(out1_chunk.iter_mut()).enumerate()
                 {
                     let row_idx = row_start + offset;
                     let row0 = &w0_rowmajor[row_idx * k_dim..(row_idx + 1) * k_dim];
@@ -2731,10 +2699,8 @@ pub(crate) fn dual_matvec_rowmajor_parallel_f32_f16(
             .enumerate()
             .for_each(|(chunk_idx, (out0_chunk, out1_chunk))| {
                 let row_start = chunk_idx * MIXED_ROW_PAR_CHUNK_ROWS;
-                for (offset, (dst0, dst1)) in out0_chunk
-                    .iter_mut()
-                    .zip(out1_chunk.iter_mut())
-                    .enumerate()
+                for (offset, (dst0, dst1)) in
+                    out0_chunk.iter_mut().zip(out1_chunk.iter_mut()).enumerate()
                 {
                     let row_idx = row_start + offset;
                     let row0 = &w0_rowmajor[row_idx * k_dim..(row_idx + 1) * k_dim];
@@ -4168,75 +4134,6 @@ fn dual_matvec_silu_mul_rowmajor_block_parallel_f32_i8(
         });
 }
 
-#[inline]
-fn dual_matvec_silu_mul_rowmajor_block_parallel_f32_bf16(
-    x: &[f32],
-    gate_w_rowmajor: &[bf16],
-    up_w_rowmajor: &[bf16],
-    _n_rows: usize,
-    k_dim: usize,
-    out: &mut [f32],
-) {
-    out.par_chunks_mut(MATVEC_BLOCK_ROWS)
-        .enumerate()
-        .for_each(|(block_idx, out_chunk)| {
-            let row_start = block_idx * MATVEC_BLOCK_ROWS;
-            let rows = out_chunk.len();
-            let gate_block = &gate_w_rowmajor[row_start * k_dim..(row_start + rows) * k_dim];
-            let up_block = &up_w_rowmajor[row_start * k_dim..(row_start + rows) * k_dim];
-            let mut gate_acc = [0.0f32; MATVEC_BLOCK_ROWS];
-            let mut up_acc = [0.0f32; MATVEC_BLOCK_ROWS];
-
-            let mut kk = 0usize;
-            while kk + 8 <= k_dim {
-                let x0 = x[kk];
-                let x1 = x[kk + 1];
-                let x2 = x[kk + 2];
-                let x3 = x[kk + 3];
-                let x4 = x[kk + 4];
-                let x5 = x[kk + 5];
-                let x6 = x[kk + 6];
-                let x7 = x[kk + 7];
-                for r in 0..rows {
-                    let base = r * k_dim + kk;
-                    gate_acc[r] += gate_block[base].to_f32() * x0
-                        + gate_block[base + 1].to_f32() * x1
-                        + gate_block[base + 2].to_f32() * x2
-                        + gate_block[base + 3].to_f32() * x3
-                        + gate_block[base + 4].to_f32() * x4
-                        + gate_block[base + 5].to_f32() * x5
-                        + gate_block[base + 6].to_f32() * x6
-                        + gate_block[base + 7].to_f32() * x7;
-                    up_acc[r] += up_block[base].to_f32() * x0
-                        + up_block[base + 1].to_f32() * x1
-                        + up_block[base + 2].to_f32() * x2
-                        + up_block[base + 3].to_f32() * x3
-                        + up_block[base + 4].to_f32() * x4
-                        + up_block[base + 5].to_f32() * x5
-                        + up_block[base + 6].to_f32() * x6
-                        + up_block[base + 7].to_f32() * x7;
-                }
-                kk += 8;
-            }
-
-            while kk < k_dim {
-                let xv = x[kk];
-                for r in 0..rows {
-                    let base = r * k_dim + kk;
-                    gate_acc[r] += gate_block[base].to_f32() * xv;
-                    up_acc[r] += up_block[base].to_f32() * xv;
-                }
-                kk += 1;
-            }
-
-            for r in 0..rows {
-                let g = gate_acc[r];
-                let sig = 1.0 / (1.0 + (-g).exp());
-                out_chunk[r] = (g * sig) * up_acc[r];
-            }
-        });
-}
-
 fn dual_matvec_silu_mul_rowmajor_parallel_bf16_f32(
     x: &[bf16],
     gate_w_rowmajor: &[f32],
@@ -5225,7 +5122,13 @@ fn matmul_rows_f16_slice(
             a_owned.as_slice()
         };
         let mut out_vec = vec![0.0f32; n_dim];
-        matvec_rowmajor_parallel_mixed(SliceRef::F16(a_slice), b_rowmajor, n_dim, k_dim, &mut out_vec);
+        matvec_rowmajor_parallel_mixed(
+            SliceRef::F16(a_slice),
+            b_rowmajor,
+            n_dim,
+            k_dim,
+            &mut out_vec,
+        );
         return Array2::from_shape_vec((1, n_dim), out_vec)
             .expect("decode matvec shape build failed");
     }
@@ -5353,7 +5256,13 @@ fn matmul_rows_bf16_slice(
             a_owned.as_slice()
         };
         let mut out_vec = vec![0.0f32; n_dim];
-        matvec_rowmajor_parallel_mixed(SliceRef::BF16(a_slice), b_rowmajor, n_dim, k_dim, &mut out_vec);
+        matvec_rowmajor_parallel_mixed(
+            SliceRef::BF16(a_slice),
+            b_rowmajor,
+            n_dim,
+            k_dim,
+            &mut out_vec,
+        );
         return Array2::from_shape_vec((1, n_dim), out_vec)
             .expect("decode matvec shape build failed");
     }
@@ -5697,14 +5606,287 @@ fn matmul_rows_bf16_i8(
     res
 }
 
-fn no_grad_tensor_from_f32_output(output: ndarray::ArrayD<f32>, dtype: DType) -> Tensor {
-    Tensor::from_f32_data_no_grad_with_dtype(output, dtype)
+fn try_cuda_matmul_buffer(
+    a: &Tensor,
+    b: &Tensor,
+    m_dim: usize,
+    k_dim: usize,
+    n_dim: usize,
+) -> Option<cuda::CudaBuffer> {
+    if a.device() != crate::autograd::Device::Cuda || b.device() != crate::autograd::Device::Cuda {
+        return None;
+    }
+    let force_cuda = is_strict_device_execution();
+    if !force_cuda && !cuda::should_accelerate_matmul(m_dim, n_dim, k_dim) {
+        return None;
+    }
+    let cuda_out = a.with_cuda_f32_buffer(|a_buf| {
+        b.with_cuda_f32_buffer(|b_buf| cuda::matmul_f32_no_host(a_buf, b_buf, m_dim, n_dim, k_dim))
+    });
+    Some(match cuda_out {
+        Ok(out) => out,
+        Err(err) => {
+            if force_cuda {
+                panic!("CUDA matmul failed in strict device execution mode: {err}");
+            }
+            return None;
+        }
+    })
+}
+
+fn try_cuda_matmul(
+    a: &Tensor,
+    b: &Tensor,
+    m_dim: usize,
+    n_dim: usize,
+    k_dim: usize,
+    output_dtype: DType,
+) -> Option<Tensor> {
+    let buffer = try_cuda_matmul_buffer(a, b, m_dim, k_dim, n_dim)?;
+    let mut out_shape = a.shape_vec();
+    let last_idx = out_shape.len() - 1;
+    out_shape[last_idx] = n_dim;
+
+    if output_dtype == DType::F32 {
+        return Some(Tensor::from_cuda_f32_buffer_no_host(
+            &out_shape,
+            buffer,
+            a.device(),
+        ));
+    }
+
+    if matches!(output_dtype, DType::F16 | DType::BF16) {
+        return Some(Tensor::from_cuda_f32_buffer_no_host_with_dtype(
+            &out_shape,
+            buffer,
+            a.device(),
+            output_dtype,
+        ));
+    }
+
+    let out = cuda::download_f32(&buffer).ok()?;
+    Some(
+        Tensor::from_f32_data_no_grad_with_device_dtype_and_cuda_buffer(
+            Array2::from_shape_vec((m_dim, n_dim), out)
+                .expect("CUDA matmul output shape build failed")
+                .into_shape(out_shape)
+                .expect("CUDA matmul output reshape failed")
+                .into_dyn(),
+            output_dtype,
+            a.device(),
+            Some(buffer),
+        ),
+    )
+}
+
+fn try_cuda_batch_matmul_buffer(
+    lhs: &Tensor,
+    rhs: &Tensor,
+    b: usize,
+    h: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Option<cuda::CudaBuffer> {
+    if lhs.device() != crate::autograd::Device::Cuda
+        || rhs.device() != crate::autograd::Device::Cuda
+    {
+        return None;
+    }
+    let batch_count = b.checked_mul(h)?;
+    let force_cuda = is_strict_device_execution();
+    if !force_cuda && !cuda::should_accelerate_batch_matmul(batch_count, m, n, k) {
+        return None;
+    }
+    let cuda_out = lhs.with_cuda_f32_buffer(|lhs_buf| {
+        rhs.with_cuda_f32_buffer(|rhs_buf| {
+            cuda::batch_matmul_f32_no_host(lhs_buf, rhs_buf, batch_count, m, n, k)
+        })
+    });
+    Some(match cuda_out {
+        Ok(out) => out,
+        Err(err) => {
+            if force_cuda {
+                panic!("CUDA batch_matmul failed in strict device execution mode: {err}");
+            }
+            return None;
+        }
+    })
+}
+
+fn try_cuda_batch_matmul(
+    lhs: &Tensor,
+    rhs: &Tensor,
+    b: usize,
+    h: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    output_dtype: DType,
+) -> Option<Tensor> {
+    let buffer = try_cuda_batch_matmul_buffer(lhs, rhs, b, h, m, k, n)?;
+    let out_shape = vec![b, h, m, n];
+    if output_dtype == DType::F32 {
+        return Some(Tensor::from_cuda_f32_buffer_no_host(
+            &out_shape,
+            buffer,
+            lhs.device(),
+        ));
+    }
+
+    if matches!(output_dtype, DType::F16 | DType::BF16) {
+        return Some(Tensor::from_cuda_f32_buffer_no_host_with_dtype(
+            &out_shape,
+            buffer,
+            lhs.device(),
+            output_dtype,
+        ));
+    }
+
+    let out = cuda::download_f32(&buffer).ok()?;
+    Some(
+        Tensor::from_f32_data_no_grad_with_device_dtype_and_cuda_buffer(
+            Array4::from_shape_vec((b, h, m, n), out)
+                .expect("CUDA batch_matmul output shape build failed")
+                .into_dyn(),
+            output_dtype,
+            lhs.device(),
+            Some(buffer),
+        ),
+    )
+}
+
+fn try_cuda_training_matmul_backward(
+    grad: &ndarray::ArrayViewD<'_, f32>,
+    cuda_grad: Option<cuda::CudaBuffer>,
+    a: &Tensor,
+    b: &Tensor,
+    m_dim: usize,
+    k_dim: usize,
+    n_dim: usize,
+) -> Result<
+    (
+        (ndarray::ArrayD<f32>, cuda::CudaBuffer),
+        (ndarray::ArrayD<f32>, cuda::CudaBuffer),
+    ),
+    String,
+> {
+    let (da_buf, db_buf) =
+        try_cuda_training_matmul_backward_buffers(grad, cuda_grad, a, b, m_dim, k_dim, n_dim)?;
+    let da_host = cuda::download_f32(&da_buf)?;
+    let db_host = cuda::download_f32(&db_buf)?;
+
+    let da = Array2::from_shape_vec((m_dim, k_dim), da_host)
+        .expect("CUDA matmul backward dA shape build failed")
+        .into_shape(a.shape_vec())
+        .expect("CUDA matmul backward dA reshape failed")
+        .into_dyn();
+    let db = Array2::from_shape_vec((n_dim, k_dim), db_host)
+        .expect("CUDA matmul backward dB shape build failed")
+        .into_dyn();
+    Ok(((da, da_buf), (db, db_buf)))
+}
+
+fn try_cuda_training_matmul_backward_buffers(
+    grad: &ndarray::ArrayViewD<'_, f32>,
+    cuda_grad: Option<cuda::CudaBuffer>,
+    a: &Tensor,
+    b: &Tensor,
+    m_dim: usize,
+    k_dim: usize,
+    n_dim: usize,
+) -> Result<(cuda::CudaBuffer, cuda::CudaBuffer), String> {
+    let grad_buf = match cuda_grad {
+        Some(buffer) if buffer.len() == grad.len() => buffer,
+        _ => cuda::upload_f32(&grad.iter().copied().collect::<Vec<_>>())?,
+    };
+    let a_buf = a
+        .cloned_cuda_f32_buffer()
+        .ok_or_else(|| "CUDA matmul backward expected lhs resident buffer".to_string())?;
+    let b_buf = b
+        .cloned_cuda_f32_buffer()
+        .ok_or_else(|| "CUDA matmul backward expected rhs resident buffer".to_string())?;
+
+    let grad_t = cuda::permute_f32_buffer(&grad_buf, &[n_dim, m_dim], &[1, 0])?;
+    let b_t = cuda::permute_f32_buffer(&b_buf, &[k_dim, n_dim], &[1, 0])?;
+    let a_t = cuda::permute_f32_buffer(&a_buf, &[k_dim, m_dim], &[1, 0])?;
+
+    let da_buf = cuda::matmul_f32_no_host(&grad_buf, &b_t, m_dim, k_dim, n_dim)?;
+    let db_buf = cuda::matmul_f32_no_host(&grad_t, &a_t, n_dim, k_dim, m_dim)?;
+    Ok((da_buf, db_buf))
+}
+
+fn try_cuda_training_batch_matmul_backward(
+    grad: &ndarray::ArrayViewD<'_, f32>,
+    cuda_grad: Option<cuda::CudaBuffer>,
+    lhs: &Tensor,
+    rhs: &Tensor,
+    b: usize,
+    h: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<
+    (
+        (ndarray::ArrayD<f32>, cuda::CudaBuffer),
+        (ndarray::ArrayD<f32>, cuda::CudaBuffer),
+    ),
+    String,
+> {
+    let (d_lhs_buf, d_rhs_buf) =
+        try_cuda_training_batch_matmul_backward_buffers(grad, cuda_grad, lhs, rhs, b, h, m, k, n)?;
+    let d_lhs_host = cuda::download_f32(&d_lhs_buf)?;
+    let d_rhs_host = cuda::download_f32(&d_rhs_buf)?;
+
+    let d_lhs = Array4::from_shape_vec((b, h, m, k), d_lhs_host)
+        .expect("CUDA batch_matmul backward dLHS shape build failed")
+        .into_dyn();
+    let d_rhs = Array4::from_shape_vec((b, h, k, n), d_rhs_host)
+        .expect("CUDA batch_matmul backward dRHS shape build failed")
+        .into_dyn();
+    Ok(((d_lhs, d_lhs_buf), (d_rhs, d_rhs_buf)))
+}
+
+fn try_cuda_training_batch_matmul_backward_buffers(
+    grad: &ndarray::ArrayViewD<'_, f32>,
+    cuda_grad: Option<cuda::CudaBuffer>,
+    lhs: &Tensor,
+    rhs: &Tensor,
+    b: usize,
+    h: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<(cuda::CudaBuffer, cuda::CudaBuffer), String> {
+    let batch_count = b
+        .checked_mul(h)
+        .ok_or_else(|| "CUDA batch_matmul backward batch count overflow".to_string())?;
+    let grad_buf = match cuda_grad {
+        Some(buffer) if buffer.len() == grad.len() => buffer,
+        _ => cuda::upload_f32(&grad.iter().copied().collect::<Vec<_>>())?,
+    };
+    let lhs_buf = lhs
+        .cloned_cuda_f32_buffer()
+        .ok_or_else(|| "CUDA batch_matmul backward expected lhs resident buffer".to_string())?;
+    let rhs_buf = rhs
+        .cloned_cuda_f32_buffer()
+        .ok_or_else(|| "CUDA batch_matmul backward expected rhs resident buffer".to_string())?;
+
+    let lhs_t = cuda::permute_f32_buffer(&lhs_buf, &[b, h, k, m], &[0, 1, 3, 2])?;
+    let rhs_t = cuda::permute_f32_buffer(&rhs_buf, &[b, h, n, k], &[0, 1, 3, 2])?;
+
+    let d_lhs_buf = cuda::batch_matmul_f32_no_host(&grad_buf, &rhs_t, batch_count, m, k, n)?;
+    let d_rhs_buf = cuda::batch_matmul_f32_no_host(&lhs_t, &grad_buf, batch_count, k, n, m)?;
+    Ok((d_lhs_buf, d_rhs_buf))
 }
 
 // A[..., K] @ B^T, where B is [N(out), K(in)]
 // output: [..., N]
 pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
+    let output_device = assert_same_device(a, b, "matmul");
     let build_graph = !is_no_grad() && (a.requires_grad() || b.requires_grad());
+    let cuda_native_supported = output_device == crate::autograd::Device::Cuda;
+    assert_native_device_support(output_device, "matmul", cuda_native_supported);
 
     let a_shape = a.shape_vec();
     let b_shape = b.shape_vec();
@@ -5727,6 +5909,112 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
 
     let m_dim = a_len / k_dim_a;
 
+    if build_graph
+        && output_device == crate::autograd::Device::Cuda
+        && let Some(buffer) = try_cuda_matmul_buffer(a, b, m_dim, k_dim_a, n_dim)
+    {
+        let mut out_shape = a_shape.clone();
+        let last_idx = out_shape.len() - 1;
+        out_shape[last_idx] = n_dim;
+
+        let a_clone = a.clone();
+        let b_clone = b.clone();
+        let output_self = Rc::new(RefCell::new(None::<Tensor>));
+        let output_self_for_backward = output_self.clone();
+        let tensor = Tensor(Rc::new(RefCell::new(TensorData {
+            data: ndarray::ArrayD::<f32>::zeros(ndarray::IxDyn(&out_shape)).into_shared(),
+            f16_data: None,
+            bf16_data: None,
+            i8_data: None,
+            cuda_f32_data: Some(buffer),
+            i8_scale: None,
+            has_f32_data: false,
+            storage_dtype: crate::precision::DType::F32,
+            cache_dirty: false,
+            is_parameter: false,
+            grad: None,
+            cuda_f32_grad: None,
+            parents: vec![a_clone.clone(), b_clone.clone()],
+            requires_grad: true,
+            backward_op: Some(std::rc::Rc::new(move |grad: &ndarray::ArrayViewD<f32>| {
+                let cuda_grad = output_self_for_backward
+                    .borrow()
+                    .as_ref()
+                    .and_then(|output| output.cloned_cuda_f32_grad())
+                    .filter(|buffer| buffer.len() == grad.len());
+                if is_strict_device_execution() {
+                    match try_cuda_training_matmul_backward_buffers(
+                        grad,
+                        cuda_grad.clone(),
+                        &a_clone,
+                        &b_clone,
+                        m_dim,
+                        k_dim_a,
+                        n_dim,
+                    ) {
+                        Ok((da_buf, db_buf)) => {
+                            a_clone.add_cuda_grad_buffer_only(da_buf);
+                            b_clone.add_cuda_grad_buffer_only(db_buf);
+                            return;
+                        }
+                        Err(err) => {
+                            panic!(
+                                "CUDA matmul backward failed in strict device execution mode: {err}"
+                            );
+                        }
+                    }
+                }
+                let cuda_result = try_cuda_training_matmul_backward(
+                    grad, cuda_grad, &a_clone, &b_clone, m_dim, k_dim_a, n_dim,
+                );
+                match cuda_result {
+                    Ok(((da, da_buf), (db, db_buf))) => {
+                        a_clone.add_grad_with_cuda_buffer(da, Some(da_buf));
+                        b_clone.add_grad_with_cuda_buffer(db, Some(db_buf));
+                    }
+                    Err(err) => {
+                        if is_strict_device_execution() {
+                            panic!(
+                                "CUDA matmul backward failed in strict device execution mode: {err}"
+                            );
+                        }
+                        let g_len = grad.len();
+                        let g_m = g_len / n_dim;
+                        let grad_2d = grad
+                            .view()
+                            .into_shape((g_m, n_dim))
+                            .expect("Grad reshape failed: non-contiguous gradient?");
+                        let (a_data, b_data) = {
+                            let ad = a_clone.0.borrow();
+                            let bd = b_clone.0.borrow();
+                            (ad.data.clone(), bd.data.clone())
+                        };
+                        let a_2d_view = a_data.view().into_shape((m_dim, k_dim_a));
+                        let a_2d_owned;
+                        let a_2d = match a_2d_view {
+                            Ok(v) => v,
+                            Err(_) => {
+                                a_2d_owned =
+                                    a_data.to_owned().into_shape((m_dim, k_dim_a)).unwrap();
+                                a_2d_owned.view()
+                            }
+                        };
+                        let b_2d = b_data.view().into_dimensionality::<Ix2>().unwrap();
+                        let mut da_2d = Array2::<f32>::zeros((m_dim, k_dim_a));
+                        general_mat_mul(1.0, &grad_2d, &b_2d, 0.0, &mut da_2d);
+                        a_clone.add_grad(da_2d.into_shape(a_data.shape()).unwrap().into_dyn());
+                        let mut db_2d = Array2::<f32>::zeros((n_dim, k_dim_a));
+                        general_mat_mul(1.0, &grad_2d.t(), &a_2d, 0.0, &mut db_2d);
+                        b_clone.add_grad(db_2d.into_dyn());
+                    }
+                }
+            })),
+            device: output_device,
+        })));
+        *output_self.borrow_mut() = Some(tensor.clone());
+        return tensor;
+    }
+
     if !build_graph {
         let input_dtype = a.dtype();
         let output_dtype = if a.dtype() == b.dtype() {
@@ -5734,6 +6022,9 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
         } else {
             DType::F32
         };
+        if let Some(cuda_out) = try_cuda_matmul(a, b, m_dim, n_dim, k_dim_a, output_dtype) {
+            return cuda_out;
+        }
         if b.dtype() == DType::I8 {
             let res_2d = match b.native_storage_owned() {
                 TensorStorageOwned::I8(b_data, scale) => {
@@ -5893,9 +6184,10 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
             let mut out_shape = a_shape.clone();
             let last_idx = out_shape.len() - 1;
             out_shape[last_idx] = n_dim;
-            return no_grad_tensor_from_f32_output(
+            return Tensor::from_f32_data_no_grad_with_device_dtype(
                 res_2d.into_shape(out_shape).unwrap().into_dyn(),
                 output_dtype,
+                output_device,
             );
         }
         let res_2d = a.with_storage_view_preferring(StoragePreference::Native, |a_view| {
@@ -5994,9 +6286,10 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
         let mut out_shape = a_shape.clone();
         let last_idx = out_shape.len() - 1;
         out_shape[last_idx] = n_dim;
-        return no_grad_tensor_from_f32_output(
+        return Tensor::from_f32_data_no_grad_with_device_dtype(
             res_2d.into_shape(out_shape).unwrap().into_dyn(),
             output_dtype,
+            output_device,
         );
     }
 
@@ -6061,12 +6354,14 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
         f16_data: None,
         bf16_data: None,
         i8_data: None,
+        cuda_f32_data: None,
         i8_scale: None,
         has_f32_data: true,
         storage_dtype: crate::precision::DType::F32,
         cache_dirty: false,
         is_parameter: false,
         grad: None,
+        cuda_f32_grad: None,
         parents: vec![a_clone.clone(), b_clone.clone()],
         requires_grad: true,
         backward_op: Some(std::rc::Rc::new(move |grad: &ndarray::ArrayViewD<f32>| {
@@ -6104,6 +6399,7 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
             general_mat_mul(1.0, &grad_2d.t(), &a_2d, 0.0, &mut db_2d);
             b_clone.add_grad(db_2d.into_dyn());
         })),
+        device: output_device,
     })))
 }
 
@@ -6111,7 +6407,10 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
 // rhs: [B, H, K, N]
 // out: [B, H, M, N]
 pub fn batch_matmul(lhs: &Tensor, rhs: &Tensor) -> Tensor {
+    let output_device = assert_same_device(lhs, rhs, "batch_matmul");
     let build_graph = !is_no_grad() && (lhs.requires_grad() || rhs.requires_grad());
+    let cuda_native_supported = output_device == crate::autograd::Device::Cuda;
+    assert_native_device_support(output_device, "batch_matmul", cuda_native_supported);
 
     let lhs_shape = lhs.shape_vec();
     let rhs_shape = rhs.shape_vec();
@@ -6125,12 +6424,123 @@ pub fn batch_matmul(lhs: &Tensor, rhs: &Tensor) -> Tensor {
     assert_eq!(h, h2, "head dim mismatch");
     assert_eq!(k, k2, "k dim mismatch");
 
+    if build_graph
+        && output_device == crate::autograd::Device::Cuda
+        && let Some(buffer) = try_cuda_batch_matmul_buffer(lhs, rhs, b, h, m, k, n)
+    {
+        let lhs_clone = lhs.clone();
+        let rhs_clone = rhs.clone();
+        let out_shape = vec![b, h, m, n];
+        let output_self = Rc::new(RefCell::new(None::<Tensor>));
+        let output_self_for_backward = output_self.clone();
+        let tensor = Tensor(Rc::new(RefCell::new(TensorData {
+            data: ndarray::ArrayD::<f32>::zeros(ndarray::IxDyn(&out_shape)).into_shared(),
+            f16_data: None,
+            bf16_data: None,
+            i8_data: None,
+            cuda_f32_data: Some(buffer),
+            i8_scale: None,
+            has_f32_data: false,
+            storage_dtype: crate::precision::DType::F32,
+            cache_dirty: false,
+            is_parameter: false,
+            grad: None,
+            cuda_f32_grad: None,
+            parents: vec![lhs_clone.clone(), rhs_clone.clone()],
+            backward_op: Some(std::rc::Rc::new(move |grad: &ndarray::ArrayViewD<f32>| {
+                let cuda_grad = output_self_for_backward
+                    .borrow()
+                    .as_ref()
+                    .and_then(|output| output.cloned_cuda_f32_grad())
+                    .filter(|buffer| buffer.len() == grad.len());
+                if is_strict_device_execution() {
+                    match try_cuda_training_batch_matmul_backward_buffers(
+                        grad,
+                        cuda_grad.clone(),
+                        &lhs_clone,
+                        &rhs_clone,
+                        b,
+                        h,
+                        m,
+                        k,
+                        n,
+                    ) {
+                        Ok((d_lhs_buf, d_rhs_buf)) => {
+                            lhs_clone.add_cuda_grad_buffer_only(d_lhs_buf);
+                            rhs_clone.add_cuda_grad_buffer_only(d_rhs_buf);
+                            return;
+                        }
+                        Err(err) => {
+                            panic!(
+                                "CUDA batch_matmul backward failed in strict device execution mode: {err}"
+                            );
+                        }
+                    }
+                }
+                let cuda_result = try_cuda_training_batch_matmul_backward(
+                    grad, cuda_grad, &lhs_clone, &rhs_clone, b, h, m, k, n,
+                );
+                match cuda_result {
+                    Ok(((d_lhs, d_lhs_buf), (d_rhs, d_rhs_buf))) => {
+                        lhs_clone.add_grad_with_cuda_buffer(d_lhs, Some(d_lhs_buf));
+                        rhs_clone.add_grad_with_cuda_buffer(d_rhs, Some(d_rhs_buf));
+                    }
+                    Err(err) => {
+                        if is_strict_device_execution() {
+                            panic!(
+                                "CUDA batch_matmul backward failed in strict device execution mode: {err}"
+                            );
+                        }
+                        let grad_view = grad.view().into_dimensionality::<Ix4>().unwrap();
+                        let l_data = lhs_clone.0.borrow().data.clone();
+                        let r_data = rhs_clone.0.borrow().data.clone();
+                        let l_view_4d = l_data.view().into_dimensionality::<Ix4>().unwrap();
+                        let r_view_4d = r_data.view().into_dimensionality::<Ix4>().unwrap();
+                        let mut d_lhs = Array4::<f32>::zeros((b, h, m, k));
+                        Zip::from(d_lhs.outer_iter_mut())
+                            .and(grad_view.outer_iter())
+                            .and(r_view_4d.outer_iter())
+                            .for_each(|mut d_l_b, g_b, r_b| {
+                                Zip::from(d_l_b.outer_iter_mut())
+                                    .and(g_b.outer_iter())
+                                    .and(r_b.outer_iter())
+                                    .for_each(|mut d_l_mat, g_mat, r_mat| {
+                                        general_mat_mul(1.0, &g_mat, &r_mat.t(), 0.0, &mut d_l_mat);
+                                    });
+                            });
+                        lhs_clone.add_grad(d_lhs.into_dyn());
+                        let mut d_rhs = Array4::<f32>::zeros((b, h, k, n));
+                        Zip::from(d_rhs.outer_iter_mut())
+                            .and(l_view_4d.outer_iter())
+                            .and(grad_view.outer_iter())
+                            .for_each(|mut d_r_b, l_b, g_b| {
+                                Zip::from(d_r_b.outer_iter_mut())
+                                    .and(l_b.outer_iter())
+                                    .and(g_b.outer_iter())
+                                    .for_each(|mut d_r_mat, l_mat, g_mat| {
+                                        general_mat_mul(1.0, &l_mat.t(), &g_mat, 0.0, &mut d_r_mat);
+                                    });
+                            });
+                        rhs_clone.add_grad(d_rhs.into_dyn());
+                    }
+                }
+            })),
+            requires_grad: true,
+            device: output_device,
+        })));
+        *output_self.borrow_mut() = Some(tensor.clone());
+        return tensor;
+    }
+
     if !build_graph {
         let output_dtype = if lhs.dtype() == rhs.dtype() {
             lhs.dtype()
         } else {
             DType::F32
         };
+        if let Some(cuda_out) = try_cuda_batch_matmul(lhs, rhs, b, h, m, k, n, output_dtype) {
+            return cuda_out;
+        }
         let output_dyn =
             lhs.with_storage_view_preferring(StoragePreference::F32Compute, |lhs_view| {
                 rhs.with_storage_view_preferring(StoragePreference::F32Compute, |rhs_view| {
@@ -6173,7 +6583,11 @@ pub fn batch_matmul(lhs: &Tensor, rhs: &Tensor) -> Tensor {
                 })
             });
 
-        return no_grad_tensor_from_f32_output(output_dyn, output_dtype);
+        return Tensor::from_f32_data_no_grad_with_device_dtype(
+            output_dyn,
+            output_dtype,
+            output_device,
+        );
     }
 
     let lhs_ref = lhs.data_ref();
@@ -6206,12 +6620,14 @@ pub fn batch_matmul(lhs: &Tensor, rhs: &Tensor) -> Tensor {
         f16_data: None,
         bf16_data: None,
         i8_data: None,
+        cuda_f32_data: None,
         i8_scale: None,
         has_f32_data: true,
         storage_dtype: crate::precision::DType::F32,
         cache_dirty: false,
         is_parameter: false,
         grad: None,
+        cuda_f32_grad: None,
         parents: vec![lhs_clone.clone(), rhs_clone.clone()],
         backward_op: Some(std::rc::Rc::new(move |grad: &ndarray::ArrayViewD<f32>| {
             let grad_view = grad.view().into_dimensionality::<Ix4>().unwrap();
@@ -6250,6 +6666,7 @@ pub fn batch_matmul(lhs: &Tensor, rhs: &Tensor) -> Tensor {
             rhs_clone.add_grad(d_rhs.into_dyn());
         })),
         requires_grad: true,
+        device: output_device,
     })))
 }
 
@@ -6257,7 +6674,13 @@ pub fn batch_matmul(lhs: &Tensor, rhs: &Tensor) -> Tensor {
 mod tests {
     use super::*;
     use crate::autograd::no_grad;
+    #[cfg(feature = "cuda")]
+    use crate::autograd::set_strict_device_execution;
+    #[cfg(feature = "cuda")]
+    use crate::ops::arithmetic::sum;
     use crate::precision::{PrecisionConfig, with_precision_config};
+    #[cfg(feature = "cuda")]
+    use ndarray::{Array, IxDyn};
 
     fn sample_f32(len: usize) -> Vec<f32> {
         (0..len)
@@ -6275,6 +6698,16 @@ mod tests {
 
     fn bf16_to_f32(src: &[bf16]) -> Vec<f32> {
         src.iter().map(|&v| v.to_f32()).collect()
+    }
+
+    #[cfg(feature = "cuda")]
+    fn make_grad_tensor(shape: &[usize], data: Vec<f32>) -> Tensor {
+        Tensor::from_data_with_grad_flag(
+            Array::from_shape_vec(IxDyn(shape), data)
+                .expect("test tensor shape mismatch")
+                .into_dyn(),
+            true,
+        )
     }
 
     fn f16_to_f32(src: &[f16]) -> Vec<f32> {
@@ -7013,6 +7446,290 @@ mod tests {
             assert!(
                 (actual - expected).abs() < 1e-5,
                 "i8 matmul output drifted: actual={actual}, expected={expected}"
+            );
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_matmul_matches_cpu_reference() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        crate::ops::cuda::set_enabled(true);
+        let a = make_tensor(&[8, 32], sample_f32(8 * 32), DType::F32);
+        let b = make_tensor(&[6, 32], sample_f32(6 * 32), DType::F32);
+
+        let out = no_grad(|| matmul(&a, &b));
+        crate::ops::cuda::set_enabled(false);
+        let reference = no_grad(|| matmul(&a, &b));
+
+        let out_vals = out.data_ref().iter().copied().collect::<Vec<_>>();
+        let ref_vals = reference.data_ref().iter().copied().collect::<Vec<_>>();
+        assert_eq!(out_vals.len(), ref_vals.len());
+        for (got, expect) in out_vals.iter().zip(ref_vals.iter()) {
+            assert!((got - expect).abs() < 1e-3, "got {got}, expect {expect}");
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_batch_matmul_matches_cpu_reference() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        crate::ops::cuda::set_enabled(true);
+        let lhs = make_tensor(&[2, 3, 4, 16], sample_f32(2 * 3 * 4 * 16), DType::F32);
+        let rhs = make_tensor(&[2, 3, 16, 5], sample_f32(2 * 3 * 16 * 5), DType::F32);
+
+        let out = no_grad(|| batch_matmul(&lhs, &rhs));
+        crate::ops::cuda::set_enabled(false);
+        let reference = no_grad(|| batch_matmul(&lhs, &rhs));
+
+        let out_vals = out.data_ref().iter().copied().collect::<Vec<_>>();
+        let ref_vals = reference.data_ref().iter().copied().collect::<Vec<_>>();
+        assert_eq!(out_vals.len(), ref_vals.len());
+        for (got, expect) in out_vals.iter().zip(ref_vals.iter()) {
+            assert!((got - expect).abs() < 1e-3, "got {got}, expect {expect}");
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_matmul_preserves_bf16_dtype_in_strict_mode() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        let a = make_tensor(&[1, 4], vec![1.0, -2.0, 0.5, 3.0], DType::BF16).to_cuda();
+        let b = make_tensor(
+            &[3, 4],
+            vec![
+                1.0, 0.0, -1.0, 2.0, 0.5, 1.5, -0.5, 0.25, -1.0, 2.0, 1.0, -0.5,
+            ],
+            DType::BF16,
+        )
+        .to_cuda();
+
+        crate::ops::cuda::set_enabled(true);
+        crate::autograd::set_strict_device_execution(true);
+        let out = no_grad(|| matmul(&a, &b));
+        crate::autograd::set_strict_device_execution(false);
+        crate::ops::cuda::set_enabled(false);
+
+        let reference = no_grad(|| matmul(&a.to_cpu(), &b.to_cpu()));
+        assert!(out.is_cuda());
+        assert_eq!(out.dtype(), DType::BF16);
+        assert!(
+            !out.has_host_f32_data(),
+            "bf16 CUDA matmul should keep output resident until host data is requested"
+        );
+        for (got, expect) in out.data_ref().iter().zip(reference.data_ref().iter()) {
+            assert!((got - expect).abs() < 2e-2, "got {got}, expect {expect}");
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_bf16_matmul_native_view_materializes_cuda_values() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        let a = make_tensor(&[1, 4], vec![1.0, -2.0, 0.5, 3.0], DType::BF16).to_cuda();
+        let b = make_tensor(
+            &[3, 4],
+            vec![
+                1.0, 0.0, -1.0, 2.0, 0.5, 1.5, -0.5, 0.25, -1.0, 2.0, 1.0, -0.5,
+            ],
+            DType::BF16,
+        )
+        .to_cuda();
+
+        crate::ops::cuda::set_enabled(true);
+        crate::autograd::set_strict_device_execution(true);
+        let out = no_grad(|| matmul(&a, &b));
+        crate::autograd::set_strict_device_execution(false);
+        crate::ops::cuda::set_enabled(false);
+
+        assert!(out.is_cuda());
+        assert_eq!(out.dtype(), DType::BF16);
+        assert!(!out.has_host_f32_data());
+
+        out.with_storage_view(|view| match view {
+            TensorStorageView::F32(view) => {
+                let vals = view.iter().copied().collect::<Vec<_>>();
+                assert!(
+                    vals.iter().any(|v| v.abs() > 1e-6),
+                    "materialized CUDA values should not be an all-zero placeholder"
+                );
+            }
+            TensorStorageView::F16(_) => panic!("bf16 matmul output should not expose f16 data"),
+            TensorStorageView::BF16(_) => {
+                panic!("bf16 CUDA-only output should materialize from its resident data")
+            }
+        });
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_matmul_preserves_i8_dtype_in_strict_mode() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        let a = make_tensor(&[1, 4], vec![1.0, -2.0, 0.5, 3.0], DType::I8).to_cuda();
+        let b = make_tensor(
+            &[3, 4],
+            vec![
+                1.0, 0.0, -1.0, 2.0, 0.5, 1.5, -0.5, 0.25, -1.0, 2.0, 1.0, -0.5,
+            ],
+            DType::I8,
+        )
+        .to_cuda();
+
+        crate::ops::cuda::set_enabled(true);
+        crate::autograd::set_strict_device_execution(true);
+        let out = no_grad(|| matmul(&a, &b));
+        crate::autograd::set_strict_device_execution(false);
+        crate::ops::cuda::set_enabled(false);
+
+        let reference = no_grad(|| matmul(&a.to_cpu(), &b.to_cpu()));
+        assert!(out.is_cuda());
+        assert_eq!(out.dtype(), DType::I8);
+        for (got, expect) in out.data_ref().iter().zip(reference.data_ref().iter()) {
+            assert!((got - expect).abs() < 1e-5, "got {got}, expect {expect}");
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_batch_matmul_preserves_bf16_dtype_in_strict_mode() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        let lhs = make_tensor(
+            &[1, 1, 2, 3],
+            vec![1.0, -2.0, 0.5, 3.0, -1.0, 2.0],
+            DType::BF16,
+        )
+        .to_cuda();
+        let rhs = make_tensor(
+            &[1, 1, 3, 2],
+            vec![0.5, 1.0, -1.5, 2.0, 0.25, -0.75],
+            DType::BF16,
+        )
+        .to_cuda();
+
+        crate::ops::cuda::set_enabled(true);
+        crate::autograd::set_strict_device_execution(true);
+        let out = no_grad(|| batch_matmul(&lhs, &rhs));
+        crate::autograd::set_strict_device_execution(false);
+        crate::ops::cuda::set_enabled(false);
+
+        let reference = no_grad(|| batch_matmul(&lhs.to_cpu(), &rhs.to_cpu()));
+        assert!(out.is_cuda());
+        assert_eq!(out.dtype(), DType::BF16);
+        assert!(
+            !out.has_host_f32_data(),
+            "bf16 CUDA batch_matmul should keep output resident until host data is requested"
+        );
+        for (got, expect) in out.data_ref().iter().zip(reference.data_ref().iter()) {
+            assert!((got - expect).abs() < 2e-2, "got {got}, expect {expect}");
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_matmul_backward_matches_cpu_reference_in_strict_mode() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        let a_data = vec![1.0, -2.0, 0.5, 3.0, -1.0, 2.0];
+        let b_data = vec![0.5, 1.0, -1.5, 2.0, 0.25, -0.75, 1.25, -0.5, 0.75];
+        let a_cpu = make_grad_tensor(&[2, 3], a_data.clone());
+        let b_cpu = make_grad_tensor(&[3, 3], b_data.clone());
+        let a_cuda = make_grad_tensor(&[2, 3], a_data).to_cuda();
+        let b_cuda = make_grad_tensor(&[3, 3], b_data).to_cuda();
+
+        crate::ops::cuda::set_enabled(true);
+        set_strict_device_execution(true);
+        let loss_cuda = sum(&matmul(&a_cuda, &b_cuda));
+        loss_cuda.backward();
+        set_strict_device_execution(false);
+        crate::ops::cuda::set_enabled(false);
+
+        let loss_cpu = sum(&matmul(&a_cpu, &b_cpu));
+        loss_cpu.backward();
+
+        assert!(!a_cuda.has_host_grad());
+        assert!(!b_cuda.has_host_grad());
+        assert!(a_cuda.cloned_cuda_f32_grad().is_some());
+        assert!(b_cuda.cloned_cuda_f32_grad().is_some());
+        let a_cuda_grad = a_cuda.grad().expect("cuda lhs grad");
+        let b_cuda_grad = b_cuda.grad().expect("cuda rhs grad");
+        let a_cpu_grad = a_cpu.grad().expect("cpu lhs grad");
+        let b_cpu_grad = b_cpu.grad().expect("cpu rhs grad");
+        for (got, expect) in a_cuda_grad.iter().zip(a_cpu_grad.iter()) {
+            assert!(
+                (got - expect).abs() < 1e-4,
+                "lhs grad got {got}, expect {expect}"
+            );
+        }
+        for (got, expect) in b_cuda_grad.iter().zip(b_cpu_grad.iter()) {
+            assert!(
+                (got - expect).abs() < 1e-4,
+                "rhs grad got {got}, expect {expect}"
+            );
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_batch_matmul_backward_matches_cpu_reference_in_strict_mode() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        let lhs_data = vec![1.0, -2.0, 0.5, 3.0, -1.0, 2.0];
+        let rhs_data = vec![0.5, 1.0, -1.5, 2.0, 0.25, -0.75];
+        let lhs_cpu = make_grad_tensor(&[1, 1, 2, 3], lhs_data.clone());
+        let rhs_cpu = make_grad_tensor(&[1, 1, 3, 2], rhs_data.clone());
+        let lhs_cuda = make_grad_tensor(&[1, 1, 2, 3], lhs_data).to_cuda();
+        let rhs_cuda = make_grad_tensor(&[1, 1, 3, 2], rhs_data).to_cuda();
+
+        crate::ops::cuda::set_enabled(true);
+        set_strict_device_execution(true);
+        let loss_cuda = sum(&batch_matmul(&lhs_cuda, &rhs_cuda));
+        loss_cuda.backward();
+        set_strict_device_execution(false);
+        crate::ops::cuda::set_enabled(false);
+
+        let loss_cpu = sum(&batch_matmul(&lhs_cpu, &rhs_cpu));
+        loss_cpu.backward();
+
+        assert!(!lhs_cuda.has_host_grad());
+        assert!(!rhs_cuda.has_host_grad());
+        assert!(lhs_cuda.cloned_cuda_f32_grad().is_some());
+        assert!(rhs_cuda.cloned_cuda_f32_grad().is_some());
+        let lhs_cuda_grad = lhs_cuda.grad().expect("cuda lhs grad");
+        let rhs_cuda_grad = rhs_cuda.grad().expect("cuda rhs grad");
+        let lhs_cpu_grad = lhs_cpu.grad().expect("cpu lhs grad");
+        let rhs_cpu_grad = rhs_cpu.grad().expect("cpu rhs grad");
+        for (got, expect) in lhs_cuda_grad.iter().zip(lhs_cpu_grad.iter()) {
+            assert!(
+                (got - expect).abs() < 1e-4,
+                "lhs grad got {got}, expect {expect}"
+            );
+        }
+        for (got, expect) in rhs_cuda_grad.iter().zip(rhs_cpu_grad.iter()) {
+            assert!(
+                (got - expect).abs() < 1e-4,
+                "rhs grad got {got}, expect {expect}"
             );
         }
     }

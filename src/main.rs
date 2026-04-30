@@ -1,9 +1,10 @@
 use mimalloc::MiMalloc;
 
-use lumen::autograd::{Tensor, no_grad};
+use lumen::autograd::{Device, Tensor, no_grad, set_strict_device_execution_scoped};
 use lumen::init::{ParameterInitMode, with_parameter_init_mode};
 use lumen::loader::{ModelLoader, WeightLoadOptions};
 use lumen::models::{LlamaConfig, LlamaModel};
+use lumen::module::Module;
 use lumen::ops::fp_kernels::active_float_backend_name;
 use lumen::ops::int8_kernels::active_int8_backend_name;
 use lumen::precision::{
@@ -42,11 +43,12 @@ struct Args {
     stream_weights: bool,
     max_seq_len: usize,
     load_only: bool,
+    device: Device,
 }
 
 fn usage(program: &str) {
     eprintln!(
-        "Usage:\n  {program} --weights PATH --tokenizer PATH [options]\n\nOptions:\n  --system TEXT              System prompt\n  --temperature FLOAT        Sampling temperature (default: 0.8)\n  --top-p FLOAT              Top-p nucleus sampling (default: 0.9)\n  --repetition-penalty FLOAT Repetition penalty (default: 1.05)\n  --recent-window N          Recent token window for repetition penalty (default: 96)\n  --max-gen N                Max generated tokens per turn (default: 200)\n  --parameter-dtype DTYPE    Default parameter dtype: f32/f16/bf16/i8 (default: f32)\n  --runtime-dtype DTYPE      Legacy shared default for activation/KV cache dtype: f32/f16/bf16 (default: f32)\n  --activation-dtype DTYPE   Activation/hidden dtype override: f32/f16/bf16/i8\n  --kv-cache-dtype DTYPE     KV cache dtype override: f32/f16/bf16\n  --quantize DTYPE           Quantize float weights on load: off/i8 (default: off)\n  --quant-scale FLOAT        Manual quantization scale override\n  --allow-parameter-copies   Allow cached parameter dtype copies\n  --stream-weights           Stream weights from disk instead of memory-mapping whole safetensors\n  --max-seq-len N            Override KV cache max sequence length (default: 2048)\n  --load-only                Load model and initialize KV cache, then exit\n\nCommands in chat:\n  /reset   Clear history and KV cache\n  /exit    Quit"
+        "Usage:\n  {program} --weights PATH --tokenizer PATH [options]\n\nOptions:\n  --system TEXT              System prompt\n  --temperature FLOAT        Sampling temperature (default: 0.8)\n  --top-p FLOAT              Top-p nucleus sampling (default: 0.9)\n  --repetition-penalty FLOAT Repetition penalty (default: 1.05)\n  --recent-window N          Recent token window for repetition penalty (default: 96)\n  --max-gen N                Max generated tokens per turn (default: 200)\n  --device DEVICE            cpu/cuda (default: cpu)\n  --parameter-dtype DTYPE    Default parameter dtype: f32/f16/bf16/i8 (default: f32)\n  --runtime-dtype DTYPE      Legacy shared default for activation/KV cache dtype: f32/f16/bf16 (default: f32)\n  --activation-dtype DTYPE   Activation/hidden dtype override: f32/f16/bf16/i8\n  --kv-cache-dtype DTYPE     KV cache dtype override: f32/f16/bf16\n  --quantize DTYPE           Quantize float weights on load: off/i8 (default: off)\n  --quant-scale FLOAT        Manual quantization scale override\n  --allow-parameter-copies   Allow cached parameter dtype copies\n  --stream-weights           Stream weights from disk instead of memory-mapping whole safetensors\n  --max-seq-len N            Override KV cache max sequence length (default: 2048)\n  --load-only                Load model and initialize KV cache, then exit\n\nCommands in chat:\n  /reset   Clear history and KV cache\n  /exit    Quit"
     );
 }
 
@@ -112,6 +114,7 @@ fn parse_args() -> Result<Args, String> {
     let mut stream_weights = false;
     let mut max_seq_len = 2048usize;
     let mut load_only = false;
+    let mut device = Device::Cpu;
 
     let mut i = 1usize;
     while i < argv.len() {
@@ -171,6 +174,19 @@ fn parse_args() -> Result<Args, String> {
                     .ok_or("--max-gen 缺少数字")?
                     .parse::<usize>()
                     .map_err(|_| "--max-gen 需要 usize")?;
+            }
+            "--device" => {
+                i += 1;
+                device = match argv
+                    .get(i)
+                    .ok_or("--device 缺少设备")?
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
+                    "cpu" => Device::Cpu,
+                    "cuda" | "gpu" => Device::Cuda,
+                    other => return Err(format!("--device 不支持 {other}，可选 cpu/cuda")),
+                };
             }
             "--parameter-dtype" => {
                 i += 1;
@@ -311,6 +327,7 @@ fn parse_args() -> Result<Args, String> {
         stream_weights,
         max_seq_len,
         load_only,
+        device,
     })
 }
 
@@ -448,12 +465,13 @@ fn sample_top_p(
     *idxs.last().unwrap()
 }
 
-fn tensor_from_token_ids(ids: &[usize]) -> Tensor {
-    Tensor::from_array_no_grad(
+fn tensor_from_token_ids(ids: &[usize], device: Device) -> Tensor {
+    let tensor = Tensor::from_array_no_grad(
         Array::from_shape_vec((1, ids.len()), ids.iter().map(|&x| x as f32).collect())
             .unwrap()
             .into_dyn(),
-    )
+    );
+    tensor.to_device(device)
 }
 
 fn last_step_logits_vec(logits: &Tensor) -> Vec<f32> {
@@ -489,13 +507,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Loading model...");
     println!(
-        "  parameter_dtype={:?} activation_dtype={:?} kv_cache_dtype={:?} quantization={:?} stream_weights={} max_seq_len={}",
+        "  parameter_dtype={:?} activation_dtype={:?} kv_cache_dtype={:?} quantization={:?} stream_weights={} max_seq_len={} device={:?}",
         args.parameter_dtype,
         args.activation_dtype,
         args.kv_cache_dtype,
         args.parameter_quantization,
         args.stream_weights,
-        args.max_seq_len
+        args.max_seq_len,
+        args.device
     );
     if env_flag_enabled("LUMEN_SHOW_BACKENDS") {
         println!(
@@ -545,6 +564,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         )
     })?;
+    let _cuda_enabled = lumen::ops::cuda::set_enabled_scoped(args.device == Device::Cuda);
+    let _strict_device_execution = set_strict_device_execution_scoped(args.device == Device::Cuda);
+    if args.device == Device::Cuda {
+        if !lumen::ops::cuda::is_available() {
+            return Err(
+                "CUDA 不可用；请确认使用 --features cuda 构建并安装 NVIDIA/CUDA 运行环境".into(),
+            );
+        }
+        model.to_cuda();
+    }
 
     println!("\nReady. Commands: /reset  /exit");
 
@@ -645,8 +674,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             all_tokens.extend_from_slice(&new_tokens);
             let assistant_start = all_tokens.len();
 
-            let prefill_logits =
-                model.forward_last_logits(tensor_from_token_ids(&new_tokens), &mut kv_caches, 0);
+            let prefill_logits = model.forward_last_logits(
+                tensor_from_token_ids(&new_tokens, args.device),
+                &mut kv_caches,
+                0,
+            );
             let mut logits_vec = last_step_logits_vec(&prefill_logits);
 
             let mut prev_gen_text = String::new();
@@ -677,7 +709,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 if args.temperature <= 1e-5 && args.repetition_penalty <= 1.0 {
                     let next = model.forward_last_argmax(
-                        tensor_from_token_ids(&[next_token]),
+                        tensor_from_token_ids(&[next_token], args.device),
                         &mut kv_caches,
                         0,
                     );
@@ -687,7 +719,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 } else {
                     let logits2 = model.forward_last_logits(
-                        tensor_from_token_ids(&[next_token]),
+                        tensor_from_token_ids(&[next_token], args.device),
                         &mut kv_caches,
                         0,
                     );

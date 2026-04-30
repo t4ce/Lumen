@@ -82,9 +82,9 @@ pub fn dot2_f32_i8_arch(
     match active_int8_backend() {
         Int8KernelBackend::Portable => None,
         #[cfg(all(feature = "arm64-int8-kernels", target_arch = "aarch64"))]
-        Int8KernelBackend::Arm64Neon => Some(unsafe {
-            dot2_f32_i8_arm64_neon(_x, _row0, _scale0, _row1, _scale1)
-        }),
+        Int8KernelBackend::Arm64Neon => {
+            Some(unsafe { dot2_f32_i8_arm64_neon(_x, _row0, _scale0, _row1, _scale1) })
+        }
         #[cfg(all(
             feature = "x86-int8-kernels",
             any(target_arch = "x86_64", target_arch = "x86")
@@ -127,7 +127,6 @@ pub fn dot3_f32_i8_arch(
         _ => None,
     }
 }
-
 
 #[cfg(all(feature = "arm64-int8-kernels", target_arch = "aarch64"))]
 #[target_feature(enable = "neon")]
@@ -506,8 +505,8 @@ mod tests {
     #[test]
     fn x86_int8_fast_paths_match_scalar_reference() {
         let x = [
-            -1.25f32, 0.5, 2.0, -0.75, 1.5, -2.25, 3.0, 0.125, 1.75, -1.0, 0.625, 2.5, -3.5,
-            4.0, -0.875, 1.125, 0.333, -0.666, 1.999,
+            -1.25f32, 0.5, 2.0, -0.75, 1.5, -2.25, 3.0, 0.125, 1.75, -1.0, 0.625, 2.5, -3.5, 4.0,
+            -0.875, 1.125, 0.333, -0.666, 1.999,
         ];
         let row0 = [
             -7i8, 3, 12, -5, 9, -11, 15, 1, 8, -4, 6, 10, -13, 14, -2, 5, 2, -3, 7,

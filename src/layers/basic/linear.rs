@@ -222,6 +222,32 @@ impl Linear {
         self.forward_decode_slice_no_bias_into(input, out_slice);
         Tensor::from_data_no_grad(data)
     }
+
+    pub fn forward_decode_rows_no_bias(&self, input: &[f32], rows: usize) -> Tensor {
+        assert!(
+            is_no_grad(),
+            "forward_decode_rows_no_bias is inference-only"
+        );
+        assert!(
+            self.bias.is_none(),
+            "forward_decode_rows_no_bias currently expects no bias"
+        );
+        assert_eq!(input.len(), rows * self.in_features, "input width mismatch");
+
+        let mut data = ArrayD::<f32>::zeros(IxDyn(&[rows, 1, self.out_features])).into_shared();
+        let out_slice = data
+            .as_slice_mut()
+            .expect("decode linear output should be contiguous");
+        for row in 0..rows {
+            let in_start = row * self.in_features;
+            let out_start = row * self.out_features;
+            self.forward_decode_slice_no_bias_into(
+                &input[in_start..in_start + self.in_features],
+                &mut out_slice[out_start..out_start + self.out_features],
+            );
+        }
+        Tensor::from_data_no_grad(data)
+    }
 }
 
 #[cfg(test)]
@@ -302,6 +328,33 @@ mod tests {
                 );
             },
         );
+    }
+
+    #[test]
+    fn linear_decode_rows_no_bias_matches_single_row_decode() {
+        let linear = Linear::new_no_bias_with_dtype(4, 3, DType::BF16);
+        linear.weight.set_array_f32_with_dtype(
+            ArrayD::from_shape_vec(
+                IxDyn(&[3, 4]),
+                vec![
+                    1.0, 0.0, -1.0, 2.0, 0.5, 1.5, -0.5, 0.25, -1.0, 2.0, 1.0, -0.5,
+                ],
+            )
+            .expect("weight shape"),
+            DType::BF16,
+        );
+        let input = vec![1.0f32, -2.0, 0.5, 3.0, -0.25, 0.75, 2.0, -1.5];
+
+        let out = no_grad(|| linear.forward_decode_rows_no_bias(&input, 2));
+        let first = no_grad(|| linear.forward_decode_slice_no_bias(&input[..4]));
+        let second = no_grad(|| linear.forward_decode_slice_no_bias(&input[4..]));
+        let out_vals = out.data_ref().iter().copied().collect::<Vec<_>>();
+        let first_vals = first.data_ref().iter().copied().collect::<Vec<_>>();
+        let second_vals = second.data_ref().iter().copied().collect::<Vec<_>>();
+
+        assert_eq!(out.shape_vec(), vec![2, 1, 3]);
+        assert_eq!(&out_vals[..3], first_vals.as_slice());
+        assert_eq!(&out_vals[3..], second_vals.as_slice());
     }
 
     #[test]

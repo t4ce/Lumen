@@ -1,5 +1,5 @@
 // src/module.rs
-use crate::autograd::{Tensor, TensorRawData, set_inference_mode};
+use crate::autograd::{Device, Tensor, TensorRawData, set_inference_mode};
 use crate::precision::{DType, ParameterQuantization, default_parameter_quantization};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
@@ -115,6 +115,20 @@ pub trait Module {
     fn apply_default_parameter_quantization(&self) {
         self.apply_parameter_quantization(default_parameter_quantization());
     }
+
+    fn to_device(&self, device: Device) {
+        for param in self.parameters() {
+            param.to_device_inplace(device);
+        }
+    }
+
+    fn to_cpu(&self) {
+        self.to_device(Device::Cpu);
+    }
+
+    fn to_cuda(&self) {
+        self.to_device(Device::Cuda);
+    }
 }
 
 pub struct Sequential {
@@ -168,9 +182,13 @@ macro_rules! sequential {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "cuda")]
+    use crate::autograd::set_strict_device_execution;
     use crate::autograd::{Tensor, no_grad};
     use crate::layers::basic::linear::Linear;
     use crate::loss::MSELoss;
+    #[cfg(feature = "cuda")]
+    use crate::ops::arithmetic::sum;
     use crate::precision::{
         DType, ParameterQuantization, PrecisionConfig, with_parameter_quantization,
         with_precision_config,
@@ -215,6 +233,31 @@ mod tests {
         let shape = param.shape_vec();
         let values = random_array(&shape, rng, -0.75, 0.75);
         param.set_array_f32_with_dtype(values, dtype);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn module_to_cuda_moves_all_parameters() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        let module = DummyModule {
+            params: vec![
+                Tensor::parameter(ArrayD::from_shape_vec(IxDyn(&[2]), vec![1.0, 2.0]).unwrap()),
+                Tensor::parameter(ArrayD::from_shape_vec(IxDyn(&[2]), vec![3.0, 4.0]).unwrap()),
+            ],
+        };
+
+        module.to_cuda();
+        for param in module.parameters() {
+            assert_eq!(param.device(), crate::autograd::Device::Cuda);
+        }
+
+        module.to_cpu();
+        for param in module.parameters() {
+            assert_eq!(param.device(), crate::autograd::Device::Cpu);
+        }
     }
 
     fn scalar_mse_for_linear(linear: &Linear, input: &Tensor, target: &Tensor) -> f32 {
@@ -491,6 +534,117 @@ mod tests {
                     1e-2,
                 );
             }
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn linear_sum_backward_matches_cpu_reference_in_strict_cuda_mode() {
+        if !crate::ops::cuda::is_available() {
+            return;
+        }
+
+        let linear_cpu = Linear::new_with_dtype(4, 2, DType::F32);
+        linear_cpu.weight.set_array_f32_with_dtype(
+            ArrayD::from_shape_vec(
+                IxDyn(&[2, 4]),
+                vec![0.5, -0.25, 1.0, 0.75, -1.0, 0.5, 0.25, -0.5],
+            )
+            .unwrap(),
+            DType::F32,
+        );
+        linear_cpu
+            .bias
+            .as_ref()
+            .expect("linear bias")
+            .set_array_f32_with_dtype(
+                ArrayD::from_shape_vec(IxDyn(&[2]), vec![0.1, -0.2]).unwrap(),
+                DType::F32,
+            );
+
+        let linear_cuda = Linear::new_with_dtype(4, 2, DType::F32);
+        linear_cuda
+            .weight
+            .set_array_f32_with_dtype(linear_cpu.weight.data_ref().to_owned(), DType::F32);
+        linear_cuda
+            .bias
+            .as_ref()
+            .expect("linear bias")
+            .set_array_f32_with_dtype(
+                linear_cpu
+                    .bias
+                    .as_ref()
+                    .expect("linear bias")
+                    .data_ref()
+                    .to_owned(),
+                DType::F32,
+            );
+        linear_cuda.to_cuda();
+
+        let input_data = ArrayD::from_shape_vec(
+            IxDyn(&[3, 4]),
+            vec![
+                1.0, -2.0, 0.5, 3.0, -1.0, 2.0, 0.0, 0.5, 0.25, -0.75, 1.5, -1.25,
+            ],
+        )
+        .unwrap();
+        let input_cpu = Tensor::from_data_with_grad_flag(input_data.clone(), true);
+        let input_cuda = Tensor::from_data_with_grad_flag(input_data, true).to_cuda();
+
+        crate::ops::cuda::set_enabled(true);
+        set_strict_device_execution(true);
+        let loss_cuda = sum(&linear_cuda.forward(input_cuda.clone()));
+        loss_cuda.backward();
+        set_strict_device_execution(false);
+        crate::ops::cuda::set_enabled(false);
+
+        let loss_cpu = sum(&linear_cpu.forward(input_cpu.clone()));
+        loss_cpu.backward();
+
+        for (got, expect) in input_cuda
+            .grad()
+            .expect("cuda input grad")
+            .iter()
+            .zip(input_cpu.grad().expect("cpu input grad").iter())
+        {
+            assert!(
+                (got - expect).abs() < 1e-4,
+                "input grad got {got}, expect {expect}"
+            );
+        }
+        for (got, expect) in linear_cuda
+            .weight
+            .grad()
+            .expect("cuda weight grad")
+            .iter()
+            .zip(linear_cpu.weight.grad().expect("cpu weight grad").iter())
+        {
+            assert!(
+                (got - expect).abs() < 1e-4,
+                "weight grad got {got}, expect {expect}"
+            );
+        }
+        for (got, expect) in linear_cuda
+            .bias
+            .as_ref()
+            .expect("cuda bias")
+            .grad()
+            .expect("cuda bias grad")
+            .iter()
+            .zip(
+                linear_cpu
+                    .bias
+                    .as_ref()
+                    .expect("cpu bias")
+                    .grad()
+                    .expect("cpu bias grad")
+                    .iter(),
+            )
+        {
+            assert!(
+                (got - expect).abs() < 1e-4,
+                "bias grad got {got}, expect {expect}"
+            );
         }
     }
 
