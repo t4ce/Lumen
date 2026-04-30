@@ -1,6 +1,6 @@
 # Lumen
 
-> A compact Rust deep learning core with dynamic autograd, flexible dtype control, safetensors loading, quantization-aware inference, and a CPU-oriented Llama runtime.
+> A compact Rust deep learning core with dynamic autograd, flexible dtype control, safetensors loading, quantization-aware inference, and CPU/CUDA Llama runtime work.
 
 [中文说明](./README_zh-CN.md) · [Repository README](./README.md)
 
@@ -16,12 +16,12 @@ Lumen is a small but fairly complete Rust ML project that connects multiple laye
 - safetensors loading with optional streaming;
 - runtime dtype control for parameters, activations, and KV cache;
 - optional on-load or offline `i8` quantization;
-- CPU inference kernels and benchmark tools.
+- CPU and optional CUDA inference/training kernels with benchmark tools.
 
 The project is best seen as both:
 
 - a **learning-oriented deep learning core in Rust**, and
-- a **CPU LLM inference playground** built around a compact Llama runtime.
+- a **CPU/CUDA LLM inference playground** built around a compact Llama runtime.
 
 It is not meant to be a full training framework, a production serving stack, or a universal launcher for arbitrary checkpoints.
 
@@ -39,11 +39,13 @@ It is not meant to be a full training framework, a production serving stack, or 
   - activation dtype
   - KV-cache dtype
 - Support for `f32`, `f16`, `bf16`, and `i8`
+- Optional CUDA execution behind the `cuda` feature, with cuDNN detection preferring system installs and falling back to Python `nvidia.cudnn`
+- CUDA-resident tensors, KV cache updates, forward decode, and a growing training/backward path
 - Quantization-aware loading and runtime configuration
 - Llama-family decoder with RMSNorm, RoPE, GQA, SwiGLU-style MLP, and incremental KV-cache decoding
 - Safetensors loading via memory mapping or streaming
 - Hugging Face `tokenizers` integration
-- Development-only kernel and end-to-end benchmark tools
+- Development-only kernel, training, and end-to-end benchmark tools
 
 ---
 
@@ -55,16 +57,17 @@ src/
 ├─ module.rs                    # Module trait / macros
 ├─ loader.rs                    # Safetensors loading and streamed loading
 ├─ tokenizer.rs                 # Tokenizer wrapper
-├─ kv_cache.rs                  # KV cache implementation
 ├─ precision.rs                 # DType / runtime precision config
-├─ ops/                         # Tensor ops and CPU kernels
+├─ ops/                         # Tensor ops, CPU kernels, and optional CUDA ops
+│  └─ cuda/lumen_cuda.cu        # CUDA/cuDNN/cuBLAS-backed kernels
 ├─ layers/                      # Neural-network layers and attention blocks
 ├─ models/llama.rs              # Llama model implementation
 ├─ main.rs                      # Minimal local inference CLI
 └─ bin/
    ├─ quantize_safetensors.rs   # Offline quantization utility
    ├─ kernel_bench.rs           # Dev-only kernel benchmark
-   └─ prefill_decode_bench.rs   # Dev-only end-to-end benchmark
+   ├─ prefill_decode_bench.rs   # Dev-only end-to-end benchmark
+   └─ cuda_cpu_bench.rs         # Dev-only CPU/CUDA ops, NN, and backward benchmark
 ```
 
 ---
@@ -98,7 +101,19 @@ Benchmark binaries are gated behind `dev-tools`:
 ```bash
 cargo build --release --features dev-tools --bin kernel_bench
 cargo build --release --features dev-tools --bin prefill_decode_bench
+cargo build --release --features dev-tools --bin cuda_cpu_bench
 ```
+
+CUDA builds are gated behind the `cuda` feature:
+
+```bash
+cargo build --release --features cuda
+cargo build --release --features "dev-tools cuda" --bin prefill_decode_bench
+```
+
+The build script searches CUDA from environment variables / `nvcc`, then common platform install paths. cuDNN probing prefers an explicit or system install, then tries the Python `nvidia.cudnn` package.
+
+On Windows, a system cuDNN install like `C:\Program Files\NVIDIA\CUDNN\...` is copied into the target directory for local runs.
 
 ---
 
@@ -128,6 +143,7 @@ Useful flags:
 - `--stream-weights`
 - `--max-seq-len N`
 - `--load-only`
+- `--device cpu|cuda`
 
 Example: BF16 runtime:
 
@@ -204,21 +220,69 @@ cargo run --release --features "dev-tools x86-fp-kernels x86-int8-kernels" --bin
 ### End-to-end prefill/decode benchmark
 
 ```bash
-cargo run --release --features "dev-tools x86-fp-kernels x86-int8-kernels" --bin prefill_decode_bench -- \
+cargo run --release --features "dev-tools cuda" --bin prefill_decode_bench -- \
   --weights path/to/model.safetensors \
   --tokenizer path/to/tokenizer.json \
   --prompt "Explain Transformer KV cache." \
-  --runs 5 --warmup 1 --max-gen 128 --mode sample \
+  --runs 5 --warmup 1 --max-gen 128 --mode greedy \
+  --device cuda \
   --parameter-dtype bf16 \
-  --runtime-dtype bf16 \
   --activation-dtype bf16 \
   --kv-cache-dtype bf16 \
   --allow-parameter-copies
 ```
 
+### CPU/CUDA ops and training benchmark
+
+```bash
+cargo run --release --features "dev-tools cuda" --bin cuda_cpu_bench -- \
+  --suite all --size small --dtype bf16 --runs 5 --warmup 1 --check
+```
+
+Use `--release` for performance numbers. Debug builds are useful for correctness but are not representative for speed.
+
 ---
 
 ## Representative baseline results
+
+## Local Environment Used For The Snapshot
+
+The CUDA numbers below were collected on this local machine:
+
+- OS: Microsoft Windows 11 Home China, `10.0.26200`, 64-bit
+- CPU: AMD Ryzen 9 8945HX with Radeon Graphics
+- RAM: 33.34 GB installed memory reported by Windows
+- GPU: NVIDIA GeForce RTX 5070 Laptop GPU, 8 GB VRAM
+- NVIDIA driver: `596.36`; runtime CUDA reported by `nvidia-smi`: `13.2`
+- CUDA toolkit: `CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0`; `nvcc 13.0.48`
+- cuDNN: `9.21.1`; detected from `C:\Program Files\NVIDIA\CUDNN\v9.21\lib\13.2\x64\cudnn.lib`
+- Rust toolchain: `stable-x86_64-pc-windows-msvc`; `rustc 1.89.0`; `cargo 1.89.0`
+
+---
+
+### CUDA snapshot
+
+Local release run on 2026-04-30 with TinyLlama weights, `--device cuda`, BF16 parameters/activations/KV cache, greedy decode:
+
+- Correctness smoke test: prompt `What is 3*3? Answer with only the number.` generated `3 * 3 = 9`; CUDA and CPU token ids matched exactly.
+- End-to-end prefill/decode: `prompt_tokens=47`, `max_gen=16`, `runs=3`, `warmup=1`.
+- Throughput: `prefill_forward=504.96 tok/s`, `decode_forward=29.67 tok/s`, `end_to_end_decode=25.21 tok/s`.
+- Stage split: prefill forward `93.08 ms`; decode forward `539.30 ms` for 16 generated tokens.
+
+Small BF16 CPU/CUDA benchmark with correctness checks:
+
+| Case | CPU | CUDA | Speedup |
+|---|---:|---:|---:|
+| `matmul.forward` | 0.969 ms | 0.033 ms | 29.53x |
+| `softmax.forward` | 0.304 ms | 0.018 ms | 16.45x |
+| `cross_entropy.backward` | 0.355 ms | 0.104 ms | 3.41x |
+| `fused_gateup.forward` | 0.324 ms | 0.071 ms | 4.55x |
+| `llama.train.backward` | 1.806 ms | 3.677 ms | 0.49x |
+| `llama.train.step` | 2.061 ms | 10.470 ms | 0.20x |
+
+Takeaway: CUDA already covers real inference, CUDA-only gradients, and training checks, but small training/backward and tiny fused-QKV cases still need more batching/fusion to beat CPU reliably.
+
+### CPU snapshot
 
 The numbers below come from the current AVX-512 baseline on the author's machine.
 
@@ -244,7 +308,7 @@ For `prompt_tokens=60`, `max_gen=128`, `runs=5`, `warmup=1`:
 
 Practical takeaway on that machine:
 
-- **BF16** is the recommended floating-point path.
+- **BF16** is the recommended floating-point path on both CPU and CUDA today.
 - **I8 weights + BF16 runtime** is the fastest tested configuration so far.
 - **F16 is currently not the main optimization target** in this implementation.
 
@@ -258,7 +322,7 @@ Practical takeaway on that machine:
 - adapting to another model may require editing dimensions, layer counts, head layout, or prompt formatting;
 - this is a compact local runner, not a universal inference frontend.
 
-The benchmark tools are also meant for development and kernel tuning, not polished public benchmarking infrastructure.
+The benchmark tools are also meant for development and kernel tuning, not polished public benchmarking infrastructure. CUDA support is real but still evolving: single CUDA device operation is the practical target today, while future multi-GPU work still needs explicit device-index plumbing through tensors, modules, and CUDA calls.
 
 ---
 
@@ -268,7 +332,7 @@ Lumen is a good fit if you want to:
 
 - learn how a Rust tensor/autograd core can be structured;
 - study a small Llama runtime without a giant framework around it;
-- experiment with dtype management, quantization, and CPU inference kernels;
+- experiment with dtype management, quantization, and CPU/CUDA inference kernels;
 - benchmark and tune a compact Rust inference stack on your own machine.
 
 ---

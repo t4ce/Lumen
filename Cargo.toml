@@ -1,8 +1,9 @@
 [package]
 name = "lumen"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 autobins = false
+build = "build.rs"
 
 [features]
 default = []
@@ -11,6 +12,7 @@ arm64-int8-kernels = []
 x86-int8-kernels = []
 arm64-fp-kernels = []
 x86-fp-kernels = []
+cuda = []
 
 [dependencies]
 ndarray = { version = "0.15", features = ["rayon"] }
@@ -49,4 +51,9 @@ required-features = ["dev-tools"]
 [[bin]]
 name = "prefill_decode_bench"
 path = "src/bin/prefill_decode_bench.rs"
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "cuda_cpu_bench"
+path = "src/bin/cuda_cpu_bench.rs"
 required-features = ["dev-tools"]
