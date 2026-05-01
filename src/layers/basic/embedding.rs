@@ -280,7 +280,7 @@ impl Embedding {
                             .expect("Embedding weight must be 2D");
                         Zip::from(out_flat.outer_iter_mut())
                             .and(&idx_values)
-                            .par_for_each(|mut out_row, &idx| {
+                            .for_each(|mut out_row, &idx| {
                                 let w_row = w_2d.slice(ndarray::s![idx, ..]);
                                 out_row.assign(&w_row);
                             });
@@ -310,7 +310,7 @@ impl Embedding {
                             .expect("Embedding weight must be 2D");
                         Zip::from(out_flat.outer_iter_mut())
                             .and(&idx_values)
-                            .par_for_each(|mut out_row, &idx| {
+                            .for_each(|mut out_row, &idx| {
                                 let w_row = w_2d.slice(ndarray::s![idx, ..]);
                                 out_row.assign(&w_row);
                             });
@@ -334,7 +334,7 @@ impl Embedding {
                             .expect("Embedding weight must be 2D");
                         Zip::from(out_flat.outer_iter_mut())
                             .and(&idx_values)
-                            .par_for_each(|mut out_row, &idx| {
+                            .for_each(|mut out_row, &idx| {
                                 let w_row = w_2d.slice(ndarray::s![idx, ..]);
                                 out_row.assign(&w_row);
                             });
@@ -357,7 +357,7 @@ impl Embedding {
                             .expect("Embedding weight must be 2D");
                         Zip::from(out_flat.outer_iter_mut())
                             .and(&idx_values)
-                            .par_for_each(|mut out_row, &idx| {
+                            .for_each(|mut out_row, &idx| {
                                 let w_row = w_2d.slice(ndarray::s![idx, ..]);
                                 out_row.assign(&w_row);
                             });
@@ -382,7 +382,7 @@ impl Embedding {
                     .expect("Embedding weight must be 2D");
                 Zip::from(out_flat.outer_iter_mut())
                     .and(&idx_values)
-                    .par_for_each(|mut out_row, &idx| {
+                    .for_each(|mut out_row, &idx| {
                         let w_row = w_2d.slice(ndarray::s![idx, ..]);
                         out_row.assign(&w_row);
                     });
@@ -393,7 +393,7 @@ impl Embedding {
                     .expect("Embedding weight must be 2D");
                 Zip::from(out_flat.outer_iter_mut())
                     .and(&idx_values)
-                    .par_for_each(|mut out_row, &idx| {
+                    .for_each(|mut out_row, &idx| {
                         let w_row = w_2d.slice(ndarray::s![idx, ..]);
                         for (dst, &src) in out_row.iter_mut().zip(w_row.iter()) {
                             *dst = src.to_f32();
@@ -406,7 +406,7 @@ impl Embedding {
                     .expect("Embedding weight must be 2D");
                 Zip::from(out_flat.outer_iter_mut())
                     .and(&idx_values)
-                    .par_for_each(|mut out_row, &idx| {
+                    .for_each(|mut out_row, &idx| {
                         let w_row = w_2d.slice(ndarray::s![idx, ..]);
                         for (dst, &src) in out_row.iter_mut().zip(w_row.iter()) {
                             *dst = src.to_f32();

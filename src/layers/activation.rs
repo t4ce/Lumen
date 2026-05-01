@@ -55,7 +55,7 @@ fn unary_no_grad(
                 }
             }
         }
-        let data = Zip::from(&input_f32).par_map_collect(|&x| op(x)).into_dyn();
+        let data = Zip::from(&input_f32).map_collect(|&x| op(x)).into_dyn();
         Tensor::from_f32_data_no_grad_with_device_dtype(data, output_dtype, output_device)
     })
 }
@@ -125,7 +125,7 @@ fn softmax_no_grad(input: &Tensor, axis: usize) -> Tensor {
         let mut y_flat = Array2::<f32>::zeros((outer_dim, last_dim));
         Zip::from(y_flat.outer_iter_mut())
             .and(x_2d.outer_iter())
-            .par_for_each(|mut y_row, x_row| {
+            .for_each(|mut y_row, x_row| {
                 let max_val = x_row.fold(f32::NEG_INFINITY, |a, &b| a.max(b));
                 let mut sum = 0.0f32;
 
@@ -202,7 +202,7 @@ fn gelu_backward_f32(x: f32, _y: f32, grad: f32) -> f32 {
 fn cpu_unary_activation_data(input: &Tensor, forward: fn(f32) -> f32) -> ndarray::ArrayD<f32> {
     let input_ref = input.data_ref();
     Zip::from(&*input_ref)
-        .par_map_collect(|&x| forward(x))
+        .map_collect(|&x| forward(x))
         .into_dyn()
 }
 
@@ -217,7 +217,7 @@ fn cpu_unary_activation_grad(
     Zip::from(grad_input.view_mut())
         .and(&*input_ref)
         .and(output_data)
-        .par_for_each(|g, &x, &y| {
+        .for_each(|g, &x, &y| {
             *g = backward(x, y, *g);
         });
     grad_input
@@ -617,7 +617,7 @@ impl Module for Softmax {
                                         Zip::from(d_input_flat.outer_iter_mut())
                                             .and(y_2d.outer_iter())
                                             .and(g_2d.outer_iter())
-                                            .par_for_each(|mut di_row, y_row, g_row| {
+                                            .for_each(|mut di_row, y_row, g_row| {
                                                 let dot: f32 = y_row
                                                     .iter()
                                                     .zip(g_row.iter())
@@ -675,7 +675,7 @@ impl Module for Softmax {
             let mut y_flat = Array2::<f32>::zeros((outer_dim, last_dim));
             Zip::from(y_flat.outer_iter_mut())
                 .and(x_2d.outer_iter())
-                .par_for_each(|mut y_row, x_row| {
+                .for_each(|mut y_row, x_row| {
                     let max_val = x_row.fold(f32::NEG_INFINITY, |a, &b| a.max(b));
                     let mut sum = 0.0f32;
 
@@ -727,7 +727,7 @@ impl Module for Softmax {
                 Zip::from(d_input_flat.outer_iter_mut())
                     .and(y_2d.outer_iter())
                     .and(g_2d.outer_iter())
-                    .par_for_each(|mut di_row, y_row, g_row| {
+                    .for_each(|mut di_row, y_row, g_row| {
                         let dot: f32 = y_row.iter().zip(g_row.iter()).map(|(&y, &g)| y * g).sum();
 
                         for (di, (&y, &g)) in di_row.iter_mut().zip(y_row.iter().zip(g_row.iter()))

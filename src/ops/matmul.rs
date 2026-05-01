@@ -12,7 +12,7 @@ use crate::precision::DType;
 use half::{bf16, f16, slice::HalfFloatSliceExt};
 use ndarray::linalg::general_mat_mul;
 use ndarray::{Array2, Array4, Ix2, Ix4, Zip};
-use rayon::prelude::*;
+use crate::parallel::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -27,6 +27,20 @@ const SILU_I8_BLOCK_ROWS: usize = 64;
 const SILU_I8_BLOCK_ROWS: usize = 32;
 
 const ARGMAX_BLOCK_ROWS: usize = 32;
+
+#[cfg(feature = "cpu-trueos")]
+unsafe extern "C" {
+    fn lumen_trueos_matvec_rowmajor_f32_bf16(
+        x: *const f32,
+        x_len: usize,
+        w_rowmajor_bf16: *const u8,
+        w_len: usize,
+        n_rows: usize,
+        k_dim: usize,
+        out: *mut f32,
+        out_len: usize,
+    ) -> i32;
+}
 
 #[cfg(all(feature = "arm64-int8-kernels", target_arch = "aarch64"))]
 const MATVEC_I8_PAR_CHUNK_ROWS: usize = 128;
@@ -1189,6 +1203,25 @@ pub fn matvec_rowmajor_parallel_f32_bf16(
     assert_eq!(x.len(), k_dim, "x len / k_dim mismatch");
     assert_eq!(w_rowmajor.len(), n_rows * k_dim, "weight size mismatch");
     assert_eq!(out.len(), n_rows, "out size mismatch");
+
+    #[cfg(feature = "cpu-trueos")]
+    if n_rows >= MATVEC_PAR_THRESHOLD {
+        let status = unsafe {
+            lumen_trueos_matvec_rowmajor_f32_bf16(
+                x.as_ptr(),
+                x.len(),
+                w_rowmajor.as_ptr() as *const u8,
+                w_rowmajor.len().saturating_mul(core::mem::size_of::<bf16>()),
+                n_rows,
+                k_dim,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        if status == 0 {
+            return;
+        }
+    }
 
     if n_rows < MATVEC_PAR_THRESHOLD {
         matvec_rowmajor_serial_f32_bf16(x, w_rowmajor, n_rows, k_dim, out);
@@ -4830,7 +4863,7 @@ fn matmul_rows_f32_bf16(
     if let Ok(a_2d) = a_view.clone().into_shape((m_dim, k_dim)) {
         Zip::from(res.outer_iter_mut())
             .and(a_2d.outer_iter())
-            .par_for_each(|mut out_row, a_row| {
+            .for_each(|mut out_row, a_row| {
                 let a_owned;
                 let a_slice: &[f32] = if let Some(s) = a_row.as_slice() {
                     s
@@ -4850,7 +4883,7 @@ fn matmul_rows_f32_bf16(
             .expect("Reshape A failed");
         Zip::from(res.outer_iter_mut())
             .and(a_2d_owned.outer_iter())
-            .par_for_each(|mut out_row, a_row| {
+            .for_each(|mut out_row, a_row| {
                 let a_owned;
                 let a_slice: &[f32] = if let Some(s) = a_row.as_slice() {
                     s
@@ -4908,7 +4941,7 @@ fn matmul_rows_f32_f16(
     if let Ok(a_2d) = a_view.clone().into_shape((m_dim, k_dim)) {
         Zip::from(res.outer_iter_mut())
             .and(a_2d.outer_iter())
-            .par_for_each(|mut out_row, a_row| {
+            .for_each(|mut out_row, a_row| {
                 let a_owned;
                 let a_slice: &[f32] = if let Some(s) = a_row.as_slice() {
                     s
@@ -4928,7 +4961,7 @@ fn matmul_rows_f32_f16(
             .expect("Reshape A failed");
         Zip::from(res.outer_iter_mut())
             .and(a_2d_owned.outer_iter())
-            .par_for_each(|mut out_row, a_row| {
+            .for_each(|mut out_row, a_row| {
                 let a_owned;
                 let a_slice: &[f32] = if let Some(s) = a_row.as_slice() {
                     s
@@ -4988,7 +5021,7 @@ fn matmul_rows_f16_f32(
     if let Ok(a_2d) = a_view.clone().into_shape((m_dim, k_dim)) {
         Zip::from(res.outer_iter_mut())
             .and(a_2d.outer_iter())
-            .par_for_each(|mut out_row, a_row| {
+            .for_each(|mut out_row, a_row| {
                 let a_owned;
                 let a_slice: &[f16] = if let Some(s) = a_row.as_slice() {
                     s
@@ -5010,7 +5043,7 @@ fn matmul_rows_f16_f32(
             .expect("Reshape A failed");
         Zip::from(res.outer_iter_mut())
             .and(a_2d_owned.outer_iter())
-            .par_for_each(|mut out_row, a_row| {
+            .for_each(|mut out_row, a_row| {
                 let a_slice = a_row.as_slice().expect("owned row must be contiguous");
                 let out_slice = out_row
                     .as_slice_mut()
@@ -5066,7 +5099,7 @@ fn matmul_rows_f16_f16(
     if let Ok(a_2d) = a_view.clone().into_shape((m_dim, k_dim)) {
         Zip::from(res.outer_iter_mut())
             .and(a_2d.outer_iter())
-            .par_for_each(|mut out_row, a_row| {
+            .for_each(|mut out_row, a_row| {
                 let a_owned;
                 let a_slice: &[f16] = if let Some(s) = a_row.as_slice() {
                     s
@@ -5088,7 +5121,7 @@ fn matmul_rows_f16_f16(
             .expect("Reshape A failed");
         Zip::from(res.outer_iter_mut())
             .and(a_2d_owned.outer_iter())
-            .par_for_each(|mut out_row, a_row| {
+            .for_each(|mut out_row, a_row| {
                 let a_slice = a_row.as_slice().expect("owned row must be contiguous");
                 let out_slice = out_row
                     .as_slice_mut()
@@ -5137,7 +5170,7 @@ fn matmul_rows_f16_slice(
     if let Ok(a_2d) = a_view.clone().into_shape((m_dim, k_dim)) {
         Zip::from(res.outer_iter_mut())
             .and(a_2d.outer_iter())
-            .par_for_each(|mut out_row, a_row| {
+            .for_each(|mut out_row, a_row| {
                 let a_owned;
                 let a_slice: &[f16] = if let Some(s) = a_row.as_slice() {
                     s
@@ -5163,7 +5196,7 @@ fn matmul_rows_f16_slice(
             .expect("Reshape A failed");
         Zip::from(res.outer_iter_mut())
             .and(a_2d.outer_iter())
-            .par_for_each(|mut out_row, a_row| {
+            .for_each(|mut out_row, a_row| {
                 let a_slice = a_row.as_slice().expect("owned row must be contiguous");
                 let out_slice = out_row
                     .as_slice_mut()
@@ -5192,7 +5225,7 @@ fn matmul_rows_i8_slice(
     if let Ok(a_2d) = a_view.clone().into_shape((m_dim, k_dim)) {
         Zip::from(res.outer_iter_mut())
             .and(a_2d.outer_iter())
-            .par_for_each(|mut out_row, a_row| {
+            .for_each(|mut out_row, a_row| {
                 let a_owned;
                 let a_slice: &[i8] = if let Some(s) = a_row.as_slice() {
                     s
@@ -5218,7 +5251,7 @@ fn matmul_rows_i8_slice(
             .expect("Reshape A failed");
         Zip::from(res.outer_iter_mut())
             .and(a_2d.outer_iter())
-            .par_for_each(|mut out_row, a_row| {
+            .for_each(|mut out_row, a_row| {
                 let a_slice = a_row.as_slice().expect("owned row must be contiguous");
                 let out_slice = out_row
                     .as_slice_mut()
@@ -5271,7 +5304,7 @@ fn matmul_rows_bf16_slice(
     if let Ok(a_2d) = a_view.clone().into_shape((m_dim, k_dim)) {
         Zip::from(res.outer_iter_mut())
             .and(a_2d.outer_iter())
-            .par_for_each(|mut out_row, a_row| {
+            .for_each(|mut out_row, a_row| {
                 let a_owned;
                 let a_slice: &[bf16] = if let Some(s) = a_row.as_slice() {
                     s
@@ -5297,7 +5330,7 @@ fn matmul_rows_bf16_slice(
             .expect("Reshape A failed");
         Zip::from(res.outer_iter_mut())
             .and(a_2d.outer_iter())
-            .par_for_each(|mut out_row, a_row| {
+            .for_each(|mut out_row, a_row| {
                 let a_slice = a_row.as_slice().expect("owned row must be contiguous");
                 let out_slice = out_row
                     .as_slice_mut()
@@ -5357,7 +5390,7 @@ fn matmul_rows_bf16_f32(
     if let Ok(a_2d) = a_view.clone().into_shape((m_dim, k_dim)) {
         Zip::from(res.outer_iter_mut())
             .and(a_2d.outer_iter())
-            .par_for_each(|mut out_row, a_row| {
+            .for_each(|mut out_row, a_row| {
                 let a_owned;
                 let a_slice: &[bf16] = if let Some(s) = a_row.as_slice() {
                     s
@@ -5379,7 +5412,7 @@ fn matmul_rows_bf16_f32(
             .expect("Reshape A failed");
         Zip::from(res.outer_iter_mut())
             .and(a_2d_owned.outer_iter())
-            .par_for_each(|mut out_row, a_row| {
+            .for_each(|mut out_row, a_row| {
                 let a_owned;
                 let a_slice: &[bf16] = if let Some(s) = a_row.as_slice() {
                     s
@@ -5441,7 +5474,7 @@ fn matmul_rows_bf16_bf16(
     if let Ok(a_2d) = a_view.clone().into_shape((m_dim, k_dim)) {
         Zip::from(res.outer_iter_mut())
             .and(a_2d.outer_iter())
-            .par_for_each(|mut out_row, a_row| {
+            .for_each(|mut out_row, a_row| {
                 let a_owned;
                 let a_slice: &[bf16] = if let Some(s) = a_row.as_slice() {
                     s
@@ -5463,7 +5496,7 @@ fn matmul_rows_bf16_bf16(
             .expect("Reshape A failed");
         Zip::from(res.outer_iter_mut())
             .and(a_2d_owned.outer_iter())
-            .par_for_each(|mut out_row, a_row| {
+            .for_each(|mut out_row, a_row| {
                 let a_owned;
                 let a_slice: &[bf16] = if let Some(s) = a_row.as_slice() {
                     s
@@ -5505,7 +5538,7 @@ fn matmul_rows_f32_i8(
     if let Ok(a_2d) = a_view.clone().into_shape((m_dim, k_dim)) {
         Zip::from(res.outer_iter_mut())
             .and(a_2d.outer_iter())
-            .par_for_each(|mut out_row, a_row| {
+            .for_each(|mut out_row, a_row| {
                 let a_owned;
                 let a_slice: &[f32] = if let Some(s) = a_row.as_slice() {
                     s
@@ -5525,7 +5558,7 @@ fn matmul_rows_f32_i8(
             .expect("Reshape A failed");
         Zip::from(res.outer_iter_mut())
             .and(a_2d_owned.outer_iter())
-            .par_for_each(|mut out_row, a_row| {
+            .for_each(|mut out_row, a_row| {
                 let a_owned;
                 let a_slice: &[f32] = if let Some(s) = a_row.as_slice() {
                     s
@@ -5565,7 +5598,7 @@ fn matmul_rows_bf16_i8(
     if let Ok(a_2d) = a_view.clone().into_shape((m_dim, k_dim)) {
         Zip::from(res.outer_iter_mut())
             .and(a_2d.outer_iter())
-            .par_for_each(|mut out_row, a_row| {
+            .for_each(|mut out_row, a_row| {
                 let a_owned;
                 let a_slice: &[bf16] = if let Some(s) = a_row.as_slice() {
                     s
@@ -5587,7 +5620,7 @@ fn matmul_rows_bf16_i8(
             .expect("Reshape A failed");
         Zip::from(res.outer_iter_mut())
             .and(a_2d_owned.outer_iter())
-            .par_for_each(|mut out_row, a_row| {
+            .for_each(|mut out_row, a_row| {
                 let a_owned;
                 let a_slice: &[bf16] = if let Some(s) = a_row.as_slice() {
                     s

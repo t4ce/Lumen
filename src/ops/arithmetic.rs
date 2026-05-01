@@ -240,7 +240,7 @@ fn add_cpu_binary_grads(lhs: &Tensor, rhs: &Tensor, grad: ArrayViewD<'_, f32>, o
         }
         BinaryOp::Sub => {
             lhs.add_grad(reduce_gradient(grad.view(), &l_shape));
-            let grad_neg = Zip::from(&grad).par_map_collect(|&x| -x);
+            let grad_neg = Zip::from(&grad).map_collect(|&x| -x);
             rhs.add_grad(reduce_gradient(grad_neg.view(), &r_shape));
         }
         BinaryOp::Mul => {
@@ -252,10 +252,10 @@ fn add_cpu_binary_grads(lhs: &Tensor, rhs: &Tensor, grad: ArrayViewD<'_, f32>, o
                     if grad.shape() == lhs_data.shape() && grad.shape() == rhs_data.shape() {
                         let gl = Zip::from(&grad)
                             .and(&*rhs_data)
-                            .par_map_collect(|&g, &b| g * b);
+                            .map_collect(|&g, &b| g * b);
                         let gr = Zip::from(&grad)
                             .and(&*lhs_data)
-                            .par_map_collect(|&g, &a| g * a);
+                            .map_collect(|&g, &a| g * a);
                         (gl, gr)
                     } else {
                         (grad.to_owned() * &*rhs_data, grad.to_owned() * &*lhs_data)

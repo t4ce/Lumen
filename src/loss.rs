@@ -5,9 +5,8 @@ use crate::autograd::{
 use crate::ops::cuda;
 use crate::precision::DType;
 use ndarray::{Array2, Zip, arr0};
-use rayon::prelude::*;
 use std::cell::RefCell;
-use std::rc::Rc; // 引入并行迭代
+use std::rc::Rc;
 
 // --- MSE Loss ---
 pub struct MSELoss;
@@ -124,7 +123,7 @@ impl MSELoss {
                     let n = out_ref.len() as f32;
                     let sum_sq: f32 = Zip::from(&out_ref)
                         .and(&tar_ref)
-                        .par_map_collect(|&o, &t| (o - t).powi(2))
+                        .map_collect(|&o, &t| (o - t).powi(2))
                         .sum();
                     sum_sq / n
                 })
@@ -165,7 +164,7 @@ impl MSELoss {
 
                     let grad = Zip::from(&*out_d)
                         .and(&*tar_d)
-                        .par_map_collect(|&o, &t| (o - t) * factor);
+                        .map_collect(|&o, &t| (o - t) * factor);
                     (grad.clone(), grad.mapv(|x| -x))
                 };
 
@@ -323,11 +322,11 @@ impl CrossEntropyLoss {
                         let targets_2d = targets_ref.view().into_shape((batch_size, dim)).unwrap();
 
                         let mut softmax_out_flat = Array2::<f32>::zeros((batch_size, dim));
-                        let total_loss: f32 = Zip::from(softmax_out_flat.outer_iter_mut())
+                        let mut total_loss = 0.0f32;
+                        Zip::from(softmax_out_flat.outer_iter_mut())
                             .and(logits_2d.outer_iter())
                             .and(targets_2d.outer_iter())
-                            .into_par_iter()
-                            .map(|(mut sm_row, l_row, t_row)| {
+                            .for_each(|mut sm_row, l_row, t_row| {
                                 let max_val = l_row.fold(f32::NEG_INFINITY, |a, &b| a.max(b));
                                 let mut sum_exp = 0.0f32;
 
@@ -347,9 +346,8 @@ impl CrossEntropyLoss {
                                         row_loss -= t_val * (*s_val + epsilon).ln();
                                     }
                                 }
-                                row_loss
-                            })
-                            .sum();
+                                total_loss += row_loss;
+                            });
 
                         (total_loss / batch_size as f32, softmax_out_flat.into_dyn())
                     },
@@ -392,7 +390,7 @@ impl CrossEntropyLoss {
 
                     Zip::from(&softmax_cache)
                         .and(&*targets_ref)
-                        .par_map_collect(|&p, &t| (p - t) * factor)
+                        .map_collect(|&p, &t| (p - t) * factor)
                 };
 
                 input_clone.add_grad(grad);

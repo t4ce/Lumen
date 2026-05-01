@@ -16,7 +16,7 @@ use crate::precision::{DType, default_activation_dtype, default_kv_cache_dtype};
 
 use ndarray::linalg::general_mat_mul;
 use ndarray::{Array, Array4, IxDyn};
-use rayon::prelude::*;
+use crate::parallel::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 

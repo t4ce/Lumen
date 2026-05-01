@@ -665,7 +665,7 @@ pub fn fused_softmax(input: &Tensor, scale: f32, is_causal: bool) -> Tensor {
 
                     Zip::from(out_view.outer_iter_mut())
                         .and(x_view.outer_iter())
-                        .par_for_each(|mut out_b, x_b| {
+                        .for_each(|mut out_b, x_b| {
                             Zip::from(out_b.outer_iter_mut())
                                 .and(x_b.outer_iter())
                                 .for_each(|mut out_h, x_h| {
@@ -733,7 +733,7 @@ pub fn fused_softmax(input: &Tensor, scale: f32, is_causal: bool) -> Tensor {
 
                     Zip::from(out_view.outer_iter_mut())
                         .and(x_view.outer_iter())
-                        .par_for_each(|mut out_b, x_b| {
+                        .for_each(|mut out_b, x_b| {
                             Zip::from(out_b.outer_iter_mut())
                                 .and(x_b.outer_iter())
                                 .for_each(|mut out_h, x_h| {
@@ -800,7 +800,7 @@ pub fn fused_softmax(input: &Tensor, scale: f32, is_causal: bool) -> Tensor {
 
                     Zip::from(out_view.outer_iter_mut())
                         .and(x_view.outer_iter())
-                        .par_for_each(|mut out_b, x_b| {
+                        .for_each(|mut out_b, x_b| {
                             Zip::from(out_b.outer_iter_mut())
                                 .and(x_b.outer_iter())
                                 .for_each(|mut out_h, x_h| {
@@ -967,7 +967,7 @@ pub fn fused_softmax(input: &Tensor, scale: f32, is_causal: bool) -> Tensor {
 
         Zip::from(out_view.outer_iter_mut())
             .and(x_view.outer_iter())
-            .par_for_each(|mut out_b, x_b| {
+            .for_each(|mut out_b, x_b| {
                 Zip::from(out_b.outer_iter_mut())
                     .and(x_b.outer_iter())
                     .for_each(|mut out_h, x_h| {
@@ -1105,7 +1105,7 @@ pub(crate) fn fused_softmax_with_past_infer(
 
             Zip::from(out_view.outer_iter_mut())
                 .and(x_view.outer_iter())
-                .par_for_each(|mut out_b, x_b| {
+                .for_each(|mut out_b, x_b| {
                     Zip::from(out_b.outer_iter_mut())
                         .and(x_b.outer_iter())
                         .for_each(|mut out_h, x_h| {
@@ -1160,7 +1160,7 @@ pub(crate) fn fused_softmax_with_past_infer(
 
             Zip::from(out_view.outer_iter_mut())
                 .and(x_view.outer_iter())
-                .par_for_each(|mut out_b, x_b| {
+                .for_each(|mut out_b, x_b| {
                     Zip::from(out_b.outer_iter_mut())
                         .and(x_b.outer_iter())
                         .for_each(|mut out_h, x_h| {
@@ -1213,7 +1213,7 @@ pub(crate) fn fused_softmax_with_past_infer(
 
             Zip::from(out_view.outer_iter_mut())
                 .and(x_view.outer_iter())
-                .par_for_each(|mut out_b, x_b| {
+                .for_each(|mut out_b, x_b| {
                     Zip::from(out_b.outer_iter_mut())
                         .and(x_b.outer_iter())
                         .for_each(|mut out_h, x_h| {

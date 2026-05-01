@@ -266,7 +266,7 @@ impl RotaryEmbedding {
 
                                     Zip::from(out_view.outer_iter_mut())
                                         .and(x_view.outer_iter())
-                                        .par_for_each(|mut out_b, x_b| {
+                                        .for_each(|mut out_b, x_b| {
                                             Zip::from(out_b.outer_iter_mut())
                                                 .and(x_b.outer_iter())
                                                 .for_each(|mut out_h, x_h| {
@@ -365,7 +365,7 @@ impl RotaryEmbedding {
 
                                         Zip::from(out_view.outer_iter_mut())
                                             .and(x_view.outer_iter())
-                                            .par_for_each(|mut out_b, x_b| {
+                                            .for_each(|mut out_b, x_b| {
                                                 Zip::from(out_b.outer_iter_mut())
                                                     .and(x_b.outer_iter())
                                                     .for_each(|mut out_h, x_h| {
@@ -405,7 +405,7 @@ impl RotaryEmbedding {
 
                                         Zip::from(out_view.outer_iter_mut())
                                             .and(x_view.outer_iter())
-                                            .par_for_each(|mut out_b, x_b| {
+                                            .for_each(|mut out_b, x_b| {
                                                 Zip::from(out_b.outer_iter_mut())
                                                     .and(x_b.outer_iter())
                                                     .for_each(|mut out_h, x_h| {
@@ -448,7 +448,7 @@ impl RotaryEmbedding {
 
                                         Zip::from(out_view.outer_iter_mut())
                                             .and(x_view.outer_iter())
-                                            .par_for_each(|mut out_b, x_b| {
+                                            .for_each(|mut out_b, x_b| {
                                                 Zip::from(out_b.outer_iter_mut())
                                                     .and(x_b.outer_iter())
                                                     .for_each(|mut out_h, x_h| {
@@ -712,7 +712,7 @@ impl RotaryEmbedding {
 
                         Zip::from(out_view.outer_iter_mut())
                             .and(x_view.outer_iter())
-                            .par_for_each(|mut out_b, x_b| {
+                            .for_each(|mut out_b, x_b| {
                                 Zip::from(out_b.outer_iter_mut())
                                     .and(x_b.outer_iter())
                                     .for_each(|mut out_h, x_h| {
@@ -755,7 +755,7 @@ impl RotaryEmbedding {
 
                                 Zip::from(d_x.outer_iter_mut())
                                     .and(grad_view.outer_iter())
-                                    .par_for_each(|mut dx_b, g_b| {
+                                    .for_each(|mut dx_b, g_b| {
                                         Zip::from(dx_b.outer_iter_mut())
                                             .and(g_b.outer_iter())
                                             .for_each(|mut dx_h, g_h| {

@@ -7,7 +7,7 @@ use crate::ops::cuda;
 use crate::precision::DType;
 use half::{bf16, f16};
 use ndarray::{Array1, Array2, Zip};
-use rayon::prelude::*;
+use crate::parallel::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -109,7 +109,7 @@ impl Module for RMSNorm {
 
                                         Zip::from(output_flat.outer_iter_mut())
                                             .and(x_2d.outer_iter())
-                                            .par_for_each(|mut out_row, x_row| {
+                                            .for_each(|mut out_row, x_row| {
                                                 let sum_sq = x_row.fold(0.0f32, |acc, &val| {
                                                     let v = val as f32 * input_scale;
                                                     acc + v * v
@@ -131,7 +131,7 @@ impl Module for RMSNorm {
                                             .expect("RMSNorm weight must be 1D");
                                         Zip::from(output_flat.outer_iter_mut())
                                             .and(x_2d.outer_iter())
-                                            .par_for_each(|mut out_row, x_row| {
+                                            .for_each(|mut out_row, x_row| {
                                                 let sum_sq = x_row.fold(0.0f32, |acc, &val| {
                                                     let v = val as f32 * input_scale;
                                                     acc + v * v
@@ -155,7 +155,7 @@ impl Module for RMSNorm {
                                             .expect("RMSNorm weight must be 1D");
                                         Zip::from(output_flat.outer_iter_mut())
                                             .and(x_2d.outer_iter())
-                                            .par_for_each(|mut out_row, x_row| {
+                                            .for_each(|mut out_row, x_row| {
                                                 let sum_sq = x_row.fold(0.0f32, |acc, &val| {
                                                     let v = val as f32 * input_scale;
                                                     acc + v * v
@@ -219,7 +219,7 @@ impl Module for RMSNorm {
 
                                     Zip::from(output_flat.outer_iter_mut())
                                         .and(x_2d.outer_iter())
-                                        .par_for_each(|mut out_row, x_row| {
+                                        .for_each(|mut out_row, x_row| {
                                             let sum_sq =
                                                 x_row.fold(0.0f32, |acc, &val| acc + val * val);
                                             let rms = (sum_sq / dim as f32 + eps).sqrt();
@@ -239,7 +239,7 @@ impl Module for RMSNorm {
 
                                     Zip::from(output_flat.outer_iter_mut())
                                         .and(x_2d.outer_iter())
-                                        .par_for_each(|mut out_row, x_row| {
+                                        .for_each(|mut out_row, x_row| {
                                             let sum_sq =
                                                 x_row.fold(0.0f32, |acc, &val| acc + val * val);
                                             let rms = (sum_sq / dim as f32 + eps).sqrt();
@@ -260,7 +260,7 @@ impl Module for RMSNorm {
 
                                     Zip::from(output_flat.outer_iter_mut())
                                         .and(x_2d.outer_iter())
-                                        .par_for_each(|mut out_row, x_row| {
+                                        .for_each(|mut out_row, x_row| {
                                             let sum_sq =
                                                 x_row.fold(0.0f32, |acc, &val| acc + val * val);
                                             let rms = (sum_sq / dim as f32 + eps).sqrt();
@@ -299,7 +299,7 @@ impl Module for RMSNorm {
 
                                     Zip::from(output_flat.outer_iter_mut())
                                         .and(x_2d.outer_iter())
-                                        .par_for_each(|mut out_row, x_row| {
+                                        .for_each(|mut out_row, x_row| {
                                             let sum_sq = x_row.fold(0.0f32, |acc, &val| {
                                                 let v = val.to_f32();
                                                 acc + v * v
@@ -321,7 +321,7 @@ impl Module for RMSNorm {
 
                                     Zip::from(output_flat.outer_iter_mut())
                                         .and(x_2d.outer_iter())
-                                        .par_for_each(|mut out_row, x_row| {
+                                        .for_each(|mut out_row, x_row| {
                                             let sum_sq = x_row.fold(0.0f32, |acc, &val| {
                                                 let v = val.to_f32();
                                                 acc + v * v
@@ -346,7 +346,7 @@ impl Module for RMSNorm {
 
                                     Zip::from(output_flat.outer_iter_mut())
                                         .and(x_2d.outer_iter())
-                                        .par_for_each(|mut out_row, x_row| {
+                                        .for_each(|mut out_row, x_row| {
                                             let sum_sq = x_row.fold(0.0f32, |acc, &val| {
                                                 let v = val.to_f32();
                                                 acc + v * v
@@ -392,7 +392,7 @@ impl Module for RMSNorm {
 
                                     Zip::from(output_flat.outer_iter_mut())
                                         .and(x_2d.outer_iter())
-                                        .par_for_each(|mut out_row, x_row| {
+                                        .for_each(|mut out_row, x_row| {
                                             let sum_sq = x_row.fold(0.0f32, |acc, &val| {
                                                 let v = val.to_f32();
                                                 acc + v * v
@@ -414,7 +414,7 @@ impl Module for RMSNorm {
 
                                     Zip::from(output_flat.outer_iter_mut())
                                         .and(x_2d.outer_iter())
-                                        .par_for_each(|mut out_row, x_row| {
+                                        .for_each(|mut out_row, x_row| {
                                             let sum_sq = x_row.fold(0.0f32, |acc, &val| {
                                                 let v = val.to_f32();
                                                 acc + v * v
@@ -439,7 +439,7 @@ impl Module for RMSNorm {
 
                                     Zip::from(output_flat.outer_iter_mut())
                                         .and(x_2d.outer_iter())
-                                        .par_for_each(|mut out_row, x_row| {
+                                        .for_each(|mut out_row, x_row| {
                                             let sum_sq = x_row.fold(0.0f32, |acc, &val| {
                                                 let v = val.to_f32();
                                                 acc + v * v
@@ -641,7 +641,7 @@ impl Module for RMSNorm {
 
                     Zip::from(output_flat.outer_iter_mut())
                         .and(x_2d.outer_iter())
-                        .par_for_each(|mut out_row, x_row| {
+                        .for_each(|mut out_row, x_row| {
                             let sum_sq = x_row.fold(0.0f32, |acc, &val| acc + val * val);
                             let rms = (sum_sq / dim as f32 + eps).sqrt();
                             let inv_rms = 1.0 / rms;
@@ -659,7 +659,7 @@ impl Module for RMSNorm {
 
                     Zip::from(output_flat.outer_iter_mut())
                         .and(x_2d.outer_iter())
-                        .par_for_each(|mut out_row, x_row| {
+                        .for_each(|mut out_row, x_row| {
                             let sum_sq = x_row.fold(0.0f32, |acc, &val| acc + val * val);
                             let rms = (sum_sq / dim as f32 + eps).sqrt();
                             let inv_rms = 1.0 / rms;
@@ -678,7 +678,7 @@ impl Module for RMSNorm {
 
                     Zip::from(output_flat.outer_iter_mut())
                         .and(x_2d.outer_iter())
-                        .par_for_each(|mut out_row, x_row| {
+                        .for_each(|mut out_row, x_row| {
                             let sum_sq = x_row.fold(0.0f32, |acc, &val| acc + val * val);
                             let rms = (sum_sq / dim as f32 + eps).sqrt();
                             let inv_rms = 1.0 / rms;
@@ -730,7 +730,7 @@ impl Module for RMSNorm {
                     Zip::from(d_input_flat.outer_iter_mut())
                         .and(x_2d.outer_iter())
                         .and(g_2d.outer_iter())
-                        .par_for_each(|mut dx_row, x_row, g_row| {
+                        .for_each(|mut dx_row, x_row, g_row| {
                             let sum_sq = x_row.fold(0.0f32, |acc, &val| acc + val * val);
                             let inv_rms = 1.0 / (sum_sq / dim as f32 + eps).sqrt();
                             let inv_dim = 1.0 / dim as f32;

@@ -394,7 +394,7 @@ pub fn conv2d(
 
     Zip::from(output.outer_iter_mut())
         .and(x_padded_view.outer_iter())
-        .par_for_each(|mut out_sample, x_sample| {
+        .for_each(|mut out_sample, x_sample| {
             let k_dim = in_channels * k_h * k_w;
             let out_pixels = out_h * out_w;
 
@@ -544,7 +544,7 @@ fn run_backward_conv2d_gemm(
     // 并行计算 dX
     Zip::from(grad_input_view.outer_iter_mut())
         .and(grad_out_view.outer_iter())
-        .par_for_each(|mut g_in_sample, g_out_sample| {
+        .for_each(|mut g_in_sample, g_out_sample| {
             // g_out_sample: [OutC, OutH, OutW] -> Reshape -> [OutC, OutPixels]
             let g_out_col = g_out_sample.to_shape((out_c, out_h * out_w)).unwrap();
 
@@ -595,7 +595,7 @@ fn run_backward_conv2d_gemm(
 
     let grad_weight_sum = Zip::from(grad_out_view.outer_iter())
         .and(x_pad_4d.outer_iter())
-        .par_map_collect(|g_out_sample, x_sample| {
+        .map_collect(|g_out_sample, x_sample| {
             let k_dim = in_c * kh * kw;
             let out_pixels = out_h * out_w;
             let g_out_col = g_out_sample.to_shape((out_c, out_pixels)).unwrap();
@@ -792,7 +792,7 @@ pub fn max_pool2d(input: &Tensor, kernel_size: (usize, usize), stride: (usize, u
     Zip::from(out_view.outer_iter_mut())
         .and(x_view.outer_iter())
         .and(argmax_view.outer_iter_mut())
-        .par_for_each(|mut out_sample, x_sample, mut argmax_sample| {
+        .for_each(|mut out_sample, x_sample, mut argmax_sample| {
             Zip::from(out_sample.outer_iter_mut())
                 .and(x_sample.outer_iter())
                 .and(argmax_sample.outer_iter_mut())
@@ -856,7 +856,7 @@ pub fn max_pool2d(input: &Tensor, kernel_size: (usize, usize), stride: (usize, u
             Zip::from(grad_input_view.outer_iter_mut())
                 .and(grad_view.outer_iter())
                 .and(argmax.view().outer_iter())
-                .par_for_each(|mut g_in_sample, g_out_sample, argmax_sample| {
+                .for_each(|mut g_in_sample, g_out_sample, argmax_sample| {
                     Zip::from(g_in_sample.outer_iter_mut())
                         .and(g_out_sample.outer_iter())
                         .and(argmax_sample.outer_iter())
