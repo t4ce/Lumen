@@ -1248,6 +1248,20 @@ impl Tensor {
     }
 
     #[inline]
+    pub fn bf16_storage_ptr_len_bytes(&self) -> Option<(*const u8, usize)> {
+        let inner = self.0.borrow();
+        if inner.storage_dtype != DType::BF16 {
+            return None;
+        }
+        let data = inner.bf16_data.as_ref()?;
+        let slice = data.as_slice()?;
+        Some((
+            slice.as_ptr() as *const u8,
+            slice.len().saturating_mul(core::mem::size_of::<bf16>()),
+        ))
+    }
+
+    #[inline]
     pub fn quantization_scale(&self) -> Option<f32> {
         let inner = self.0.borrow();
         if inner.storage_dtype == DType::I8 {
